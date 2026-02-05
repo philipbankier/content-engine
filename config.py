@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # ===== PUBLISHING =====
     upload_post_api_key: str = ""
     upload_post_user: str = "autopilot-001"
+    medium_integration_token: str = ""  # Get from https://medium.com/me/settings
 
     # ===== SYSTEM =====
     database_url: str = "sqlite+aiosqlite:///./autopilot.db"
@@ -66,6 +67,16 @@ class Settings(BaseSettings):
     demo_mode: bool = True  # If true, use demo data and disable live agents
     seed_on_startup: bool = True  # Auto-seed demo data when app starts (only if demo_mode=true)
     daily_cost_limit: float = 5.00  # Stop agents if daily cost exceeds this (USD)
+
+    # ===== METRICS SCRAPING =====
+    playwright_headless: bool = True  # Run browser in headless mode for scraping
+    metrics_scrape_enabled: bool = True  # Enable real metrics scraping via Playwright
+
+    # ===== ENGAGEMENT SETTINGS =====
+    engagement_max_replies_per_post: int = 5  # Max replies on a single post
+    engagement_max_proactive_per_day: int = 10  # Max proactive engagements daily
+    engagement_auto_post_replies: bool = True  # Auto-post comment replies
+    engagement_auto_post_proactive: bool = False  # Auto-post proactive comments (risky)
 
     # ===== AGENT INTERVALS (seconds) =====
     scout_interval: int = 1800  # 30 minutes

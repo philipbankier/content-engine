@@ -215,3 +215,23 @@ class SkillInteraction(Base):
     synergy_score = Column(Float, default=0.0)
     last_used_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class EngagementAction(Base):
+    """Track engagement actions (replies, proactive comments) for learning."""
+
+    __tablename__ = "engagement_actions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    action_type = Column(String(32), nullable=False, index=True)  # "reply" | "proactive"
+    platform = Column(String(32), nullable=False, index=True)
+    target_url = Column(Text, nullable=False)  # URL of post/comment we're responding to
+    target_author = Column(String(128), nullable=True)  # Author of the original content
+    target_text = Column(Text, nullable=True)  # Text of original comment (for replies)
+    our_text = Column(Text, nullable=False)  # Our reply/comment text
+    publication_id = Column(Integer, nullable=True, index=True)  # Link to our post (for replies)
+    skills_used = Column(JSON, nullable=True)
+    status = Column(String(32), default="pending")  # pending / posted / failed
+    posted_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)

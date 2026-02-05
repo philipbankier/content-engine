@@ -141,12 +141,49 @@ class UploadPostPublisher(BasePublisher):
             "platform": platform,
         }
 
-    async def get_metrics(self, post_id: str) -> dict:
-        """upload-post.com doesn't provide metrics — return empty stub."""
+    async def get_metrics(self, post_id: str, platform: str = None, platform_url: str = None) -> dict:
+        """Get engagement metrics for a published post.
+
+        Args:
+            post_id: The upload-post.com post ID
+            platform: Platform name (linkedin, x, youtube)
+            platform_url: Direct URL to the post on the platform
+
+        Returns:
+            Metrics dict with views, likes, comments, shares, engagement_rate
+        """
+        from config import settings
+
+        # If we have a platform URL and scraping is enabled, use the real scraper
+        if platform_url and settings.metrics_scrape_enabled:
+            try:
+                from metrics.scraper import scrape_metrics
+
+                logger.info("Scraping real metrics for %s: %s", platform, platform_url)
+                metrics = await scrape_metrics(
+                    platform=platform or "linkedin",
+                    url=platform_url,
+                    headless=settings.playwright_headless
+                )
+
+                # Only return scraped metrics if we got something useful
+                if metrics.get("views", 0) > 0 or metrics.get("likes", 0) > 0:
+                    return metrics
+
+            except ImportError:
+                logger.warning("Playwright not installed - falling back to stub metrics")
+            except Exception as e:
+                logger.error("Metrics scraping failed: %s", e)
+
+        # Fallback to stub metrics
         return {
             "views": 0,
             "likes": 0,
             "comments": 0,
             "shares": 0,
-            "note": "Metrics not available via upload-post.com",
+            "saves": 0,
+            "clicks": 0,
+            "followers_gained": 0,
+            "engagement_rate": 0.0,
+            "note": "Metrics not available via upload-post.com (no platform_url provided)",
         }

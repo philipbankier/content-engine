@@ -153,11 +153,17 @@ class TrackerAgent(BaseAgent):
 
         if publication.platform == "tiktok":
             publisher = TikTokPublisher()
+            if publication.platform_post_id:
+                return await publisher.get_metrics(publication.platform_post_id)
         else:
             publisher = UploadPostPublisher()
-
-        if publication.platform_post_id:
-            return await publisher.get_metrics(publication.platform_post_id)
+            if publication.platform_post_id or publication.platform_url:
+                # Pass platform_url to enable real metrics scraping
+                return await publisher.get_metrics(
+                    post_id=publication.platform_post_id or "",
+                    platform=publication.platform,
+                    platform_url=publication.platform_url,
+                )
 
         # Return empty metrics if no publisher or no post ID
         return {"views": 0, "likes": 0, "comments": 0, "shares": 0, "clicks": 0}

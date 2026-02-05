@@ -14,7 +14,7 @@ from db import async_session
 from models import (
     ContentDiscovery, ContentCreation, ContentPublication,
     ContentMetric, ContentExperiment, ContentAgentRun,
-    ContentPlaybook, SkillRecord, SkillMetric,
+    ContentPlaybook, SkillRecord, SkillMetric, EngagementAction,
 )
 from skills.manager import SkillManager
 from skills.evaluator import SkillEvaluator
@@ -1814,4 +1814,208 @@ async def get_quality_stats():
             }
             for r in rows
         ],
+    }
+
+
+# ── Engagement endpoints ──────────────────────────────────
+
+
+@router.get("/engagements")
+async def get_engagements(limit: int = 50, action_type: str | None = None, status: str | None = None):
+    """Get engagement actions (replies and proactive comments).
+
+    Args:
+        limit: Maximum number to return
+        action_type: Filter by type (reply, proactive)
+        status: Filter by status (pending, pending_review, posted, failed)
+    """
+    async with async_session() as session:
+        query = select(EngagementAction).order_by(desc(EngagementAction.created_at)).limit(limit)
+        if action_type:
+            query = query.where(EngagementAction.action_type == action_type)
+        if status:
+            query = query.where(EngagementAction.status == status)
+        result = await session.execute(query)
+        actions = result.scalars().all()
+
+    return {
+        "total": len(actions),
+        "engagements": [
+            {
+                "id": a.id,
+                "action_type": a.action_type,
+                "platform": a.platform,
+                "target_url": a.target_url,
+                "target_author": a.target_author,
+                "target_text_preview": (a.target_text or "")[:100],
+                "our_text": a.our_text,
+                "publication_id": a.publication_id,
+                "skills_used": a.skills_used,
+                "status": a.status,
+                "posted_at": a.posted_at.isoformat() if a.posted_at else None,
+                "error": a.error,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in actions
+        ],
+    }
+
+
+@router.get("/engagements/pending")
+async def get_pending_engagements():
+    """Get engagement actions pending review (proactive comments that need human approval)."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(EngagementAction)
+            .where(EngagementAction.status == "pending_review")
+            .order_by(EngagementAction.created_at)
+        )
+        actions = result.scalars().all()
+
+    return {
+        "total": len(actions),
+        "pending": [
+            {
+                "id": a.id,
+                "action_type": a.action_type,
+                "platform": a.platform,
+                "target_url": a.target_url,
+                "target_author": a.target_author,
+                "target_text": a.target_text,
+                "our_text": a.our_text,
+                "skills_used": a.skills_used,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in actions
+        ],
+    }
+
+
+@router.post("/engagements/{engagement_id}/approve")
+async def approve_engagement(engagement_id: int):
+    """Approve and post a pending engagement action."""
+    async with async_session() as session:
+        action = (await session.execute(
+            select(EngagementAction).where(EngagementAction.id == engagement_id)
+        )).scalar_one_or_none()
+
+        if not action:
+            raise HTTPException(404, f"Engagement {engagement_id} not found")
+
+        if action.status not in ("pending", "pending_review"):
+            raise HTTPException(400, f"Engagement {engagement_id} is not pending (status: {action.status})")
+
+        # Try to post the engagement
+        try:
+            from engagement.comment_scraper import CommentScraper
+            scraper = CommentScraper(headless=settings.playwright_headless)
+
+            # For proactive engagements, we need to post to the target URL
+            result = await scraper.post_reply(action.platform, action.target_url, action.our_text)
+
+            if result.get("success"):
+                action.status = "posted"
+                action.posted_at = datetime.now(timezone.utc)
+                await session.commit()
+                return {"status": "posted", "id": engagement_id}
+            else:
+                action.status = "failed"
+                action.error = result.get("error")
+                await session.commit()
+                return {"status": "failed", "id": engagement_id, "error": result.get("error")}
+
+        except ImportError:
+            raise HTTPException(503, "Playwright not installed - cannot post engagement")
+        except Exception as e:
+            action.status = "failed"
+            action.error = str(e)
+            await session.commit()
+            raise HTTPException(500, str(e))
+
+
+@router.post("/engagements/{engagement_id}/reject")
+async def reject_engagement(engagement_id: int):
+    """Reject a pending engagement action."""
+    async with async_session() as session:
+        action = (await session.execute(
+            select(EngagementAction).where(EngagementAction.id == engagement_id)
+        )).scalar_one_or_none()
+
+        if not action:
+            raise HTTPException(404, f"Engagement {engagement_id} not found")
+
+        action.status = "rejected"
+        await session.commit()
+
+    return {"status": "rejected", "id": engagement_id}
+
+
+@router.post("/engage")
+async def trigger_engagement():
+    """Manually trigger an engagement cycle (replies + proactive).
+
+    This will:
+    1. Scan recent publications for new comments and generate replies
+    2. Find trending content and generate proactive engagement (queued for review)
+    """
+    if not _orchestrator:
+        raise HTTPException(503, "Orchestrator not running")
+    try:
+        from agents.engagement import EngagementAgent
+        agent = EngagementAgent()
+        result = await agent.run()
+        return result
+    except Exception as e:
+        logger.error("Manual engagement failed: %s", traceback.format_exc())
+        raise HTTPException(500, str(e))
+
+
+@router.get("/engagements/stats")
+async def get_engagement_stats():
+    """Get engagement statistics."""
+    async with async_session() as session:
+        # Count by action type and status
+        result = await session.execute(
+            select(
+                EngagementAction.action_type,
+                EngagementAction.status,
+                func.count(EngagementAction.id).label("count")
+            )
+            .group_by(EngagementAction.action_type, EngagementAction.status)
+        )
+        rows = result.all()
+
+        # Count by platform
+        platform_result = await session.execute(
+            select(
+                EngagementAction.platform,
+                func.count(EngagementAction.id).label("count")
+            )
+            .where(EngagementAction.status == "posted")
+            .group_by(EngagementAction.platform)
+        )
+        platform_rows = platform_result.all()
+
+        # Today's count
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_result = await session.execute(
+            select(func.count(EngagementAction.id))
+            .where(EngagementAction.created_at >= today_start)
+            .where(EngagementAction.action_type == "proactive")
+        )
+        proactive_today = today_result.scalar() or 0
+
+    # Organize by type
+    by_type = {}
+    for row in rows:
+        if row.action_type not in by_type:
+            by_type[row.action_type] = {}
+        by_type[row.action_type][row.status] = row.count
+
+    return {
+        "by_type": by_type,
+        "by_platform": {r.platform: r.count for r in platform_rows},
+        "proactive_today": proactive_today,
+        "proactive_daily_limit": settings.engagement_max_proactive_per_day,
+        "proactive_remaining": max(0, settings.engagement_max_proactive_per_day - proactive_today),
     }
