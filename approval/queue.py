@@ -16,13 +16,81 @@ logger = logging.getLogger(__name__)
 QUALITY_AUTO_REJECT_THRESHOLD = 0.4
 QUALITY_WARNING_THRESHOLD = 0.6
 
-# Platform-specific length expectations
+# Platform-specific quality profiles with comprehensive checks
+PLATFORM_QUALITY_PROFILES = {
+    "linkedin": {
+        "min_length": 150,
+        "ideal_length": (300, 1500),
+        "max_length": 3000,
+        "requires_paragraphs": True,
+        "ideal_sentence_length": (12, 25),
+        "banned_words": ["revolutionary", "game-changing", "excited to announce", "synergy", "leverage"],
+        "requires_cta": False,
+        "hook_max_length": 200,
+        "max_exclamations": 1,
+        "max_emojis": 3,
+    },
+    "twitter": {
+        "min_length": 20,
+        "ideal_length": (100, 250),
+        "max_length": 280,
+        "requires_paragraphs": False,
+        "ideal_sentence_length": (5, 15),
+        "banned_words": ["revolutionary"],
+        "requires_cta": False,
+        "hook_max_length": 100,
+        "max_exclamations": 2,
+        "max_emojis": 5,
+    },
+    "youtube": {
+        "min_length": 100,
+        "ideal_length": (200, 500),
+        "max_length": 1000,
+        "requires_paragraphs": False,
+        "requires_hook": True,
+        "hook_max_length": 50,  # First line spoken aloud - keep it punchy
+        "requires_pacing": True,  # Needs [pause], [emphasis] markers for video
+        "ideal_sentence_length": (8, 18),
+        "banned_words": ["click below", "smash that like"],
+        "max_exclamations": 2,
+        "max_emojis": 2,
+    },
+    "tiktok": {
+        "min_length": 20,
+        "ideal_length": (50, 200),
+        "max_length": 300,
+        "requires_paragraphs": False,
+        "ideal_sentence_length": (5, 12),
+        "banned_words": [],
+        "requires_cta": False,
+        "hook_max_length": 40,  # Very short hook for fast scrolling
+        "max_exclamations": 3,
+        "max_emojis": 8,
+    },
+    "medium": {
+        "min_length": 500,
+        "ideal_length": (1200, 4000),
+        "max_length": 10000,
+        "requires_paragraphs": True,
+        "ideal_sentence_length": (15, 30),
+        "banned_words": ["revolutionary", "game-changing"],
+        "requires_cta": False,
+        "requires_sections": True,  # Should have ## headers
+        "hook_max_length": 250,
+        "max_exclamations": 2,
+        "max_emojis": 1,
+    },
+}
+
+# Legacy format for backward compatibility
 PLATFORM_LENGTH_RANGES = {
-    "linkedin": {"min": 100, "max": 3000, "ideal_min": 200, "ideal_max": 1500},
-    "twitter": {"min": 10, "max": 280, "ideal_min": 50, "ideal_max": 250},
-    "youtube": {"min": 50, "max": 5000, "ideal_min": 100, "ideal_max": 2000},
-    "tiktok": {"min": 20, "max": 500, "ideal_min": 50, "ideal_max": 300},
-    "medium": {"min": 300, "max": 10000, "ideal_min": 800, "ideal_max": 5000},
+    platform: {
+        "min": profile["min_length"],
+        "max": profile["max_length"],
+        "ideal_min": profile["ideal_length"][0],
+        "ideal_max": profile["ideal_length"][1],
+    }
+    for platform, profile in PLATFORM_QUALITY_PROFILES.items()
 }
 
 
@@ -30,11 +98,12 @@ class QualityChecker:
     """Pre-approval quality gate for content.
 
     Evaluates content on multiple dimensions before risk assessment.
+    Uses platform-specific quality profiles for appropriate thresholds.
     Content scoring below QUALITY_AUTO_REJECT_THRESHOLD (0.4) is auto-rejected.
     """
 
     def check(self, content: ContentCreation) -> dict:
-        """Evaluate content quality.
+        """Evaluate content quality using platform-specific profiles.
 
         Returns:
             dict with keys:
@@ -46,6 +115,9 @@ class QualityChecker:
         body = content.body or ""
         title = content.title or ""
         platform = content.platform or "linkedin"
+
+        # Get platform-specific profile
+        profile = PLATFORM_QUALITY_PROFILES.get(platform, PLATFORM_QUALITY_PROFILES["linkedin"])
 
         issues = []
         metrics = {}
@@ -63,18 +135,18 @@ class QualityChecker:
                     "metrics": {"placeholder_detected": True},
                 }
 
-        # 1. Length score
-        length_score, length_issues = self._check_length(body, platform)
+        # 1. Length score (platform-specific)
+        length_score, length_issues = self._check_length_with_profile(body, platform, profile)
         metrics["length"] = length_score
         issues.extend(length_issues)
 
         # 2. Readability score (sentence structure, word complexity)
-        readability_score, readability_issues = self._check_readability(body)
+        readability_score, readability_issues = self._check_readability_with_profile(body, profile)
         metrics["readability"] = readability_score
         issues.extend(readability_issues)
 
         # 3. Structure score (paragraphs, formatting)
-        structure_score, structure_issues = self._check_structure(body, platform)
+        structure_score, structure_issues = self._check_structure_with_profile(body, platform, profile)
         metrics["structure"] = structure_score
         issues.extend(structure_issues)
 
@@ -84,18 +156,47 @@ class QualityChecker:
         issues.extend(title_issues)
 
         # 5. Content substance (not just filler/fluff)
-        substance_score, substance_issues = self._check_substance(body)
+        substance_score, substance_issues = self._check_substance_with_profile(body, profile)
         metrics["substance"] = substance_score
         issues.extend(substance_issues)
 
-        # Weighted average
-        weights = {
-            "length": 0.15,
-            "readability": 0.20,
-            "structure": 0.15,
-            "title": 0.15,
-            "substance": 0.35,
-        }
+        # 6. Hook quality (platform-specific)
+        hook_score, hook_issues = self._check_hook(body, profile)
+        metrics["hook"] = hook_score
+        issues.extend(hook_issues)
+
+        # Weighted average with platform-aware weighting
+        if platform in ("twitter", "tiktok"):
+            # Short-form: hook matters more, structure matters less
+            weights = {
+                "length": 0.15,
+                "readability": 0.15,
+                "structure": 0.10,
+                "title": 0.10,
+                "substance": 0.25,
+                "hook": 0.25,
+            }
+        elif platform == "medium":
+            # Long-form: structure and substance matter more
+            weights = {
+                "length": 0.15,
+                "readability": 0.20,
+                "structure": 0.20,
+                "title": 0.15,
+                "substance": 0.20,
+                "hook": 0.10,
+            }
+        else:
+            # Default (LinkedIn, YouTube)
+            weights = {
+                "length": 0.15,
+                "readability": 0.15,
+                "structure": 0.15,
+                "title": 0.10,
+                "substance": 0.25,
+                "hook": 0.20,
+            }
+
         overall_score = sum(metrics[k] * weights[k] for k in weights)
 
         passed = overall_score >= QUALITY_AUTO_REJECT_THRESHOLD
@@ -107,35 +208,49 @@ class QualityChecker:
             "warning": warning and passed,
             "issues": issues,
             "metrics": {k: round(v, 3) for k, v in metrics.items()},
+            "platform_profile": platform,
         }
 
     def _check_length(self, body: str, platform: str) -> tuple[float, list[str]]:
-        """Check if content length is appropriate for platform."""
+        """Check if content length is appropriate for platform (legacy method)."""
+        profile = PLATFORM_QUALITY_PROFILES.get(platform, PLATFORM_QUALITY_PROFILES["linkedin"])
+        return self._check_length_with_profile(body, platform, profile)
+
+    def _check_length_with_profile(self, body: str, platform: str, profile: dict) -> tuple[float, list[str]]:
+        """Check if content length is appropriate using platform profile."""
         issues = []
         length = len(body)
-        ranges = PLATFORM_LENGTH_RANGES.get(platform, PLATFORM_LENGTH_RANGES["linkedin"])
 
-        if length < ranges["min"]:
-            issues.append(f"Content too short ({length} chars, min {ranges['min']})")
+        min_len = profile["min_length"]
+        max_len = profile["max_length"]
+        ideal_min, ideal_max = profile["ideal_length"]
+
+        if length < min_len:
+            issues.append(f"Content too short for {platform} ({length} chars, min {min_len})")
             return 0.0, issues
-        if length > ranges["max"]:
-            issues.append(f"Content too long ({length} chars, max {ranges['max']})")
+        if length > max_len:
+            issues.append(f"Content too long for {platform} ({length} chars, max {max_len})")
             return 0.3, issues
 
         # Score based on ideal range
-        if ranges["ideal_min"] <= length <= ranges["ideal_max"]:
+        if ideal_min <= length <= ideal_max:
             return 1.0, issues
-        elif length < ranges["ideal_min"]:
+        elif length < ideal_min:
             # Scale between min and ideal_min
-            ratio = (length - ranges["min"]) / (ranges["ideal_min"] - ranges["min"])
+            ratio = (length - min_len) / (ideal_min - min_len) if ideal_min > min_len else 1.0
             return 0.5 + 0.5 * ratio, issues
         else:
             # Scale between ideal_max and max
-            ratio = (ranges["max"] - length) / (ranges["max"] - ranges["ideal_max"])
+            ratio = (max_len - length) / (max_len - ideal_max) if max_len > ideal_max else 1.0
             return 0.5 + 0.5 * ratio, issues
 
     def _check_readability(self, body: str) -> tuple[float, list[str]]:
-        """Check readability using simple heuristics."""
+        """Check readability using simple heuristics (legacy method)."""
+        profile = PLATFORM_QUALITY_PROFILES.get("linkedin", PLATFORM_QUALITY_PROFILES["linkedin"])
+        return self._check_readability_with_profile(body, profile)
+
+    def _check_readability_with_profile(self, body: str, profile: dict) -> tuple[float, list[str]]:
+        """Check readability using platform-specific profile."""
         issues = []
 
         if not body.strip():
@@ -147,21 +262,26 @@ class QualityChecker:
         if not sentences:
             return 0.2, ["No complete sentences found"]
 
-        # Average sentence length (aim for 15-25 words)
+        # Platform-specific ideal sentence length
+        ideal_min, ideal_max = profile.get("ideal_sentence_length", (12, 25))
+
         word_counts = [len(s.split()) for s in sentences]
         avg_sentence_length = sum(word_counts) / len(word_counts)
 
-        if avg_sentence_length > 40:
-            issues.append("Sentences too long (avg {:.0f} words)".format(avg_sentence_length))
+        # Score based on platform's ideal range
+        if ideal_min <= avg_sentence_length <= ideal_max:
+            sentence_score = 1.0
+        elif avg_sentence_length > ideal_max * 1.5:
+            issues.append(f"Sentences too long (avg {avg_sentence_length:.0f} words, ideal {ideal_min}-{ideal_max})")
             sentence_score = 0.3
-        elif avg_sentence_length > 30:
-            issues.append("Sentences somewhat long (avg {:.0f} words)".format(avg_sentence_length))
+        elif avg_sentence_length > ideal_max:
+            issues.append(f"Sentences somewhat long (avg {avg_sentence_length:.0f} words)")
             sentence_score = 0.6
-        elif avg_sentence_length < 5:
-            issues.append("Sentences too short (avg {:.0f} words)".format(avg_sentence_length))
+        elif avg_sentence_length < ideal_min * 0.5:
+            issues.append(f"Sentences too short (avg {avg_sentence_length:.0f} words)")
             sentence_score = 0.5
         else:
-            sentence_score = 1.0
+            sentence_score = 0.8
 
         # Check for all caps (shouting)
         caps_ratio = sum(1 for c in body if c.isupper()) / max(len(body), 1)
@@ -171,26 +291,57 @@ class QualityChecker:
         else:
             caps_score = 1.0
 
-        return (sentence_score * 0.7 + caps_score * 0.3), issues
+        # Check for excessive exclamation marks
+        max_exclamations = profile.get("max_exclamations", 2)
+        exclamation_count = body.count("!")
+        if exclamation_count > max_exclamations:
+            issues.append(f"Too many exclamation marks ({exclamation_count}, max {max_exclamations})")
+            exclamation_score = 0.5
+        else:
+            exclamation_score = 1.0
+
+        return (sentence_score * 0.6 + caps_score * 0.2 + exclamation_score * 0.2), issues
 
     def _check_structure(self, body: str, platform: str) -> tuple[float, list[str]]:
-        """Check content structure and formatting."""
-        issues = []
+        """Check content structure and formatting (legacy method)."""
+        profile = PLATFORM_QUALITY_PROFILES.get(platform, PLATFORM_QUALITY_PROFILES["linkedin"])
+        return self._check_structure_with_profile(body, platform, profile)
 
-        # Check for paragraph breaks (except Twitter which is short)
-        if platform not in ["twitter", "tiktok"]:
+    def _check_structure_with_profile(self, body: str, platform: str, profile: dict) -> tuple[float, list[str]]:
+        """Check content structure using platform-specific profile."""
+        issues = []
+        score = 1.0
+
+        # Check for paragraph breaks if required
+        if profile.get("requires_paragraphs", False):
             paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-            if len(paragraphs) == 1 and len(body) > 500:
-                issues.append("Single large paragraph - needs breaks")
-                return 0.4, issues
+            min_len = profile["min_length"]
+            if len(paragraphs) == 1 and len(body) > min_len * 2:
+                issues.append(f"Single large paragraph on {platform} - needs breaks")
+                score = min(score, 0.4)
+
+        # Check for sections/headers if required (Medium long-form)
+        if profile.get("requires_sections", False):
+            has_headers = bool(re.search(r'^#{1,3}\s', body, re.MULTILINE))
+            if len(body) > 1000 and not has_headers:
+                issues.append("Long-form content missing section headers")
+                score = min(score, 0.6)
 
         # Check for bullet points / lists in long-form content
         has_lists = bool(re.search(r'^[\-\*•]\s', body, re.MULTILINE))
-        if platform in ["linkedin", "medium"] and len(body) > 800 and not has_lists:
+        ideal_max = profile["ideal_length"][1]
+        if profile.get("requires_paragraphs", False) and len(body) > ideal_max and not has_lists:
             # Not a hard penalty, just slightly lower score
-            return 0.7, issues
+            score = min(score, 0.7)
 
-        return 1.0, issues
+        # Check for pacing markers if required (YouTube scripts)
+        if profile.get("requires_pacing", False):
+            has_pacing = bool(re.search(r'\[(pause|emphasis|beat)\]', body, re.IGNORECASE))
+            if not has_pacing:
+                # Mild suggestion, not a hard fail
+                pass  # Could add soft guidance here
+
+        return score, issues
 
     def _check_title(self, title: str, platform: str) -> tuple[float, list[str]]:
         """Check title quality."""
@@ -225,7 +376,12 @@ class QualityChecker:
         return 1.0, issues
 
     def _check_substance(self, body: str) -> tuple[float, list[str]]:
-        """Check if content has substance vs just filler."""
+        """Check if content has substance vs just filler (legacy method)."""
+        profile = PLATFORM_QUALITY_PROFILES.get("linkedin", PLATFORM_QUALITY_PROFILES["linkedin"])
+        return self._check_substance_with_profile(body, profile)
+
+    def _check_substance_with_profile(self, body: str, profile: dict) -> tuple[float, list[str]]:
+        """Check if content has substance using platform-specific profile."""
         issues = []
 
         if not body.strip():
@@ -251,6 +407,16 @@ class QualityChecker:
         else:
             filler_score = 1.0
 
+        # Check for banned words (platform-specific)
+        banned_words = profile.get("banned_words", [])
+        body_lower = body.lower()
+        found_banned = [w for w in banned_words if w.lower() in body_lower]
+        if found_banned:
+            issues.append(f"Contains banned phrases: {', '.join(found_banned[:3])}")
+            banned_score = 0.5
+        else:
+            banned_score = 1.0
+
         # Check for repetition (same word repeated excessively)
         word_freq = {}
         for w in words:
@@ -273,7 +439,51 @@ class QualityChecker:
                 issues.append("Contains placeholder text")
                 return 0.2, issues
 
-        return (filler_score * 0.5 + repeat_score * 0.5), issues
+        return (filler_score * 0.4 + repeat_score * 0.3 + banned_score * 0.3), issues
+
+    def _check_hook(self, body: str, profile: dict) -> tuple[float, list[str]]:
+        """Check the quality of the opening hook."""
+        issues = []
+
+        if not body.strip():
+            return 0.0, []
+
+        # Get first line as the hook
+        first_line = body.split("\n")[0].strip()
+        hook_max_length = profile.get("hook_max_length", 200)
+
+        # Check hook length
+        if len(first_line) < 15:
+            issues.append("Hook too short to capture attention")
+            return 0.4, issues
+
+        if len(first_line) > hook_max_length:
+            issues.append(f"Hook too long ({len(first_line)} chars, max {hook_max_length})")
+            return 0.6, issues
+
+        score = 1.0
+
+        # Penalize self-focused hooks
+        if first_line.startswith(("I ", "We ", "Our ", "My ")):
+            issues.append("Self-focused hook (starts with I/We/Our)")
+            score = min(score, 0.6)
+
+        # Penalize exclamation-heavy hooks
+        if first_line.endswith("!"):
+            issues.append("Hook ends with exclamation mark")
+            score = min(score, 0.7)
+
+        # Penalize hyperbolic language
+        hyperbolic = ["excited", "thrilled", "amazing", "incredible", "revolutionary", "game-changing"]
+        if any(word in first_line.lower() for word in hyperbolic):
+            issues.append("Hook contains hyperbolic language")
+            score = min(score, 0.5)
+
+        # Bonus for question hooks (engagement driver)
+        if "?" in first_line:
+            score = min(1.0, score + 0.1)
+
+        return score, issues
 
 
 class ApprovalQueue:

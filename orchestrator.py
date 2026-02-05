@@ -243,9 +243,18 @@ class Orchestrator:
         return result
 
     async def _review_cycle(self):
-        """Run weekly review."""
+        """Run weekly review and skill decay."""
         result = await self.reviewer.run()
         logger.info("Weekly review: %s", result)
+
+        # Apply time decay to unused skills
+        decayed = self.skill_manager.apply_decay_to_all()
+        if decayed:
+            logger.info(
+                "Skill decay applied to %d skills: %s",
+                len(decayed),
+                {k: f"-{v:.3f}" for k, v in decayed.items()}
+            )
 
     async def trigger_scout(self) -> dict:
         """Manually trigger a scout cycle. Used by API."""

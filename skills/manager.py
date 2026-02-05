@@ -94,6 +94,14 @@ class SkillManager:
     # Outcome tracking
     # ------------------------------------------------------------------
 
+    # Confidence bounds to prevent extreme values
+    CONFIDENCE_FLOOR = 0.2
+    CONFIDENCE_CEILING = 0.95
+
+    # Time decay settings
+    DECAY_RATE_PER_DAY = 0.005  # 0.5% decay per day of inactivity
+    MAX_DECAY = 0.3  # Maximum 30% total decay
+
     def record_outcome(
         self,
         skill_name: str,
@@ -111,8 +119,37 @@ class SkillManager:
         now = at or datetime.now(timezone.utc)
         old_confidence = skill.confidence
 
-        # Weighted rolling average: 0.7 old + 0.3 new
-        skill.confidence = 0.7 * skill.confidence + 0.3 * score
+        # Step 1: Apply time decay before updating (if skill was previously used)
+        if skill.last_used_at:
+            days_since = (now - skill.last_used_at).days
+            if days_since > 0:
+                decay = min(days_since * self.DECAY_RATE_PER_DAY, self.MAX_DECAY)
+                skill.confidence = max(self.CONFIDENCE_FLOOR, skill.confidence - decay)
+                if decay > 0.01:
+                    logger.debug(
+                        "Skill '%s' decayed by %.3f (%.0f days inactive)",
+                        skill_name, decay, days_since
+                    )
+
+        # Step 2: Adaptive weighting based on skill maturity
+        # New skills adapt faster to feedback, mature skills are more stable
+        if skill.total_uses < 5:
+            weight_new = 0.5  # New skills adapt faster
+        elif skill.total_uses < 15:
+            weight_new = 0.4  # Building maturity
+        elif skill.total_uses < 30:
+            weight_new = 0.35  # Moderately stable
+        else:
+            weight_new = 0.3  # Mature skills more stable
+
+        weight_old = 1 - weight_new
+
+        # Step 3: Update confidence with weighted rolling average
+        skill.confidence = weight_old * skill.confidence + weight_new * score
+
+        # Step 4: Apply confidence bounds
+        skill.confidence = max(self.CONFIDENCE_FLOOR, min(self.CONFIDENCE_CEILING, skill.confidence))
+
         skill.total_uses += 1
         skill.last_used_at = now
         skill.updated_at = now
@@ -127,8 +164,9 @@ class SkillManager:
         confidence_delta = skill.confidence - old_confidence
         if abs(confidence_delta) > 0.01:
             logger.info(
-                "Skill '%s' confidence: %.3f → %.3f (%+.3f) from %s",
-                skill_name, old_confidence, skill.confidence, confidence_delta, outcome
+                "Skill '%s' confidence: %.3f → %.3f (%+.3f) from %s [uses=%d, weight=%.0f%%]",
+                skill_name, old_confidence, skill.confidence, confidence_delta,
+                outcome, skill.total_uses, weight_new * 100
             )
 
         # Record to SkillMetric table (async in background)
@@ -144,6 +182,40 @@ class SkillManager:
 
         # Persist skill state to SkillRecord table
         self._persist_skill_to_db(skill)
+
+    def apply_decay_to_all(self, at: Optional[datetime] = None) -> dict[str, float]:
+        """Apply time decay to all skills that haven't been used recently.
+
+        This should be called periodically (e.g., weekly) to ensure unused
+        skills don't maintain artificially high confidence.
+
+        Returns a dict of skill_name -> decay_amount for skills that decayed.
+        """
+        now = at or datetime.now(timezone.utc)
+        decayed = {}
+
+        for skill_name, skill in self._skills.items():
+            if skill.last_used_at is None:
+                continue
+
+            days_since = (now - skill.last_used_at).days
+            if days_since < 7:  # Only decay if inactive for 7+ days
+                continue
+
+            old_confidence = skill.confidence
+            decay = min(days_since * self.DECAY_RATE_PER_DAY, self.MAX_DECAY)
+            skill.confidence = max(self.CONFIDENCE_FLOOR, skill.confidence - decay)
+
+            if old_confidence != skill.confidence:
+                decayed[skill_name] = old_confidence - skill.confidence
+                skill.updated_at = now
+                self._persist_skill_to_db(skill)
+                logger.info(
+                    "Skill '%s' decayed: %.3f → %.3f (%.0f days inactive)",
+                    skill_name, old_confidence, skill.confidence, days_since
+                )
+
+        return decayed
 
     def _record_metric_to_db(
         self,

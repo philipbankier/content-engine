@@ -1,14 +1,16 @@
 """TrackerAgent: collects engagement metrics from published content."""
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from agents.base import BaseAgent
 from db import async_session
-from models import ContentPublication, ContentMetric, ContentCreation
+from models import ContentPublication, ContentMetric, ContentCreation, SkillMetric, SkillInteraction
 from skills.manager import SkillManager
+from itertools import combinations
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,7 @@ def _get_skill_manager() -> SkillManager:
         _skill_manager.load_all()
     return _skill_manager
 
+
 # Intervals to collect metrics at (hours since publication)
 METRIC_INTERVALS = {
     "1h": timedelta(hours=1),
@@ -30,6 +33,45 @@ METRIC_INTERVALS = {
     "24h": timedelta(hours=24),
     "48h": timedelta(hours=48),
     "7d": timedelta(days=7),
+}
+
+# Platform-specific engagement benchmarks for composite scoring
+PLATFORM_BENCHMARKS = {
+    "linkedin": {
+        "engagement_rate": 0.05,  # 5% is excellent
+        "share_rate": 0.01,       # 1% share rate is good
+        "save_rate": 0.02,        # 2% save rate is good
+        "comment_rate": 0.005,    # 0.5% comment rate is good
+        "click_rate": 0.02,       # 2% CTR is good
+    },
+    "twitter": {
+        "engagement_rate": 0.03,
+        "share_rate": 0.02,
+        "save_rate": 0.01,
+        "comment_rate": 0.003,
+        "click_rate": 0.015,
+    },
+    "youtube": {
+        "engagement_rate": 0.08,
+        "share_rate": 0.005,
+        "save_rate": 0.03,
+        "comment_rate": 0.01,
+        "click_rate": 0.03,
+    },
+    "tiktok": {
+        "engagement_rate": 0.10,
+        "share_rate": 0.03,
+        "save_rate": 0.05,
+        "comment_rate": 0.02,
+        "click_rate": 0.02,
+    },
+    "medium": {
+        "engagement_rate": 0.04,
+        "share_rate": 0.01,
+        "save_rate": 0.02,
+        "comment_rate": 0.005,
+        "click_rate": 0.03,
+    },
 }
 
 
@@ -79,6 +121,7 @@ class TrackerAgent(BaseAgent):
                             likes=metrics.get("likes", 0),
                             comments=metrics.get("comments", 0),
                             shares=metrics.get("shares", 0),
+                            saves=metrics.get("saves", 0),  # Bookmarks/saves
                             clicks=metrics.get("clicks", 0),
                             followers_gained=metrics.get("followers_gained", 0),
                             engagement_rate=metrics.get("engagement_rate", 0.0),
@@ -122,10 +165,11 @@ class TrackerAgent(BaseAgent):
     async def _update_skill_outcomes_from_metrics(
         self, publication: ContentPublication, metrics: dict, now: datetime
     ) -> int:
-        """Update skill outcomes based on actual engagement metrics.
+        """Update skill outcomes based on actual engagement metrics with weighted attribution.
 
         This is the critical link that connects real performance back to skills.
-        We use engagement_rate as the primary signal, normalized to 0-1 scale.
+        Uses multi-signal composite scoring and weighted skill attribution based on
+        historical baselines to properly attribute success/failure to individual skills.
 
         Returns the number of skills updated.
         """
@@ -150,49 +194,76 @@ class TrackerAgent(BaseAgent):
         if not skills_used:
             return 0
 
-        # Calculate score from engagement metrics
-        # Engagement rate is typically 1-10%, so we normalize:
-        # - 0-1% = poor (0.0-0.3)
-        # - 1-3% = average (0.3-0.6)
-        # - 3-5% = good (0.6-0.8)
-        # - 5%+ = excellent (0.8-1.0)
-        engagement_rate = metrics.get("engagement_rate", 0.0)
+        platform = publication.platform or "linkedin"
 
-        # Normalize to 0-1 score
-        if engagement_rate >= 0.05:
-            score = 0.8 + min((engagement_rate - 0.05) * 4, 0.2)  # 0.8-1.0
-        elif engagement_rate >= 0.03:
-            score = 0.6 + (engagement_rate - 0.03) * 10  # 0.6-0.8
-        elif engagement_rate >= 0.01:
-            score = 0.3 + (engagement_rate - 0.01) * 15  # 0.3-0.6
+        # Calculate composite score from multiple engagement signals
+        composite_score = self._calculate_composite_score(metrics, platform)
+
+        # Get historical baselines for each skill used
+        skill_baselines = await self._get_skill_baselines(skills_used)
+
+        # Calculate expected performance given the skill mix
+        if skill_baselines:
+            expected_score = sum(skill_baselines.values()) / len(skill_baselines)
         else:
-            score = max(engagement_rate * 30, 0.0)  # 0.0-0.3
+            expected_score = 0.5  # Default expectation
 
-        # Determine outcome based on score
-        if score >= 0.6:
-            outcome = "success"
-        elif score >= 0.3:
-            outcome = "partial"
-        else:
-            outcome = "failure"
-
-        # Record outcome for each skill used
+        # Record outcome for each skill with weighted attribution
         skill_manager = _get_skill_manager()
         updated = 0
 
         for skill_name in skills_used:
+            baseline = skill_baselines.get(skill_name, 0.5)
+
+            # Attribute contribution based on deviation from baseline
+            if composite_score >= expected_score:
+                # Success: skills that historically underperform get credit for lifting
+                # (they contributed more than expected)
+                if expected_score > 0:
+                    contribution = baseline / expected_score
+                else:
+                    contribution = 1.0
+                # Bound contribution factor
+                contribution = max(0.5, min(1.5, contribution))
+            else:
+                # Failure: skills that historically overperform get penalized more
+                # (they failed to deliver their expected value)
+                if baseline > 0:
+                    shortfall = expected_score - composite_score
+                    contribution = 1 + (baseline - 0.5) * (shortfall / 0.5)
+                else:
+                    contribution = 1.0
+                # Bound contribution factor
+                contribution = max(0.5, min(1.5, contribution))
+
+            # Calculate attributed score
+            attributed_score = composite_score * contribution
+            attributed_score = max(0.0, min(1.0, attributed_score))
+
+            # Determine outcome based on attributed score
+            if attributed_score >= 0.6:
+                outcome = "success"
+            elif attributed_score >= 0.3:
+                outcome = "partial"
+            else:
+                outcome = "failure"
+
             skill_manager.record_outcome(
                 skill_name=skill_name,
                 outcome=outcome,
-                score=score,
+                score=attributed_score,
                 at=now,
                 agent="tracker",
                 task="engagement_feedback",
                 context={
                     "publication_id": publication.id,
                     "creation_id": creation.id,
-                    "platform": publication.platform,
-                    "engagement_rate": engagement_rate,
+                    "platform": platform,
+                    "raw_composite_score": composite_score,
+                    "skill_baseline": baseline,
+                    "expected_score": expected_score,
+                    "contribution_factor": contribution,
+                    "engagement_rate": metrics.get("engagement_rate", 0.0),
                     "views": metrics.get("views", 0),
                     "likes": metrics.get("likes", 0),
                     "comments": metrics.get("comments", 0),
@@ -201,8 +272,175 @@ class TrackerAgent(BaseAgent):
             )
             updated += 1
             logger.info(
-                "Skill '%s' outcome updated: %.3f (engagement: %.2f%%) from %s content",
-                skill_name, score, engagement_rate * 100, publication.platform
+                "Skill '%s' outcome: %.3f (baseline: %.3f, contribution: %.2fx) from %s",
+                skill_name, attributed_score, baseline, contribution, platform
+            )
+
+        # Track skill interactions (combinations of 2+ skills)
+        if len(skills_used) >= 2:
+            await self._update_skill_interactions(
+                skills_used, composite_score, skill_baselines, now
             )
 
         return updated
+
+    async def _update_skill_interactions(
+        self,
+        skills_used: list[str],
+        composite_score: float,
+        skill_baselines: dict[str, float],
+        now: datetime,
+    ) -> None:
+        """Track skill co-occurrence outcomes to discover synergies and conflicts.
+
+        For each pair of skills used together, calculates a synergy score:
+        - Positive synergy: skills amplify each other (combined > individual averages)
+        - Negative synergy: skills conflict (combined < individual averages)
+        """
+        # Generate all pairs of skills
+        skill_pairs = list(combinations(sorted(skills_used), 2))
+
+        async with async_session() as session:
+            for skill_a, skill_b in skill_pairs:
+                # Calculate expected score based on individual baselines
+                baseline_a = skill_baselines.get(skill_a, 0.5)
+                baseline_b = skill_baselines.get(skill_b, 0.5)
+                expected_combined = (baseline_a + baseline_b) / 2
+
+                # Synergy = actual combined - expected combined
+                # Positive = they work better together than individually
+                # Negative = they conflict
+                synergy = composite_score - expected_combined
+
+                # Find or create interaction record
+                result = await session.execute(
+                    select(SkillInteraction).where(
+                        SkillInteraction.skill_a == skill_a,
+                        SkillInteraction.skill_b == skill_b,
+                    )
+                )
+                interaction = result.scalar_one_or_none()
+
+                if interaction is None:
+                    # Create new interaction record
+                    interaction = SkillInteraction(
+                        skill_a=skill_a,
+                        skill_b=skill_b,
+                        co_occurrence_count=1,
+                        avg_combined_score=composite_score,
+                        synergy_score=synergy,
+                        last_used_at=now,
+                        updated_at=now,
+                    )
+                    session.add(interaction)
+                else:
+                    # Update existing record with rolling average
+                    n = interaction.co_occurrence_count
+                    interaction.avg_combined_score = (
+                        interaction.avg_combined_score * n + composite_score
+                    ) / (n + 1)
+                    interaction.synergy_score = (
+                        interaction.synergy_score * n + synergy
+                    ) / (n + 1)
+                    interaction.co_occurrence_count = n + 1
+                    interaction.last_used_at = now
+                    interaction.updated_at = now
+
+                # Log significant synergies
+                if abs(interaction.synergy_score) > 0.1 and interaction.co_occurrence_count >= 3:
+                    if interaction.synergy_score > 0:
+                        logger.info(
+                            "SYNERGY: %s + %s = +%.2f (n=%d)",
+                            skill_a, skill_b, interaction.synergy_score,
+                            interaction.co_occurrence_count
+                        )
+                    else:
+                        logger.warning(
+                            "CONFLICT: %s + %s = %.2f (n=%d)",
+                            skill_a, skill_b, interaction.synergy_score,
+                            interaction.co_occurrence_count
+                        )
+
+            await session.commit()
+
+    def _calculate_composite_score(self, metrics: dict, platform: str) -> float:
+        """Calculate weighted composite score from multiple engagement signals.
+
+        Uses platform-specific benchmarks to normalize each signal and weights
+        them to produce a single 0-1 score.
+        """
+        benchmarks = PLATFORM_BENCHMARKS.get(platform, PLATFORM_BENCHMARKS["linkedin"])
+
+        views = max(metrics.get("views", 1), 1)  # Avoid division by zero
+        engagement_rate = metrics.get("engagement_rate", 0.0)
+        shares = metrics.get("shares", 0)
+        saves = metrics.get("saves", 0)  # May not be available for all platforms
+        comments = metrics.get("comments", 0)
+        clicks = metrics.get("clicks", 0)
+
+        # Calculate individual rates
+        share_rate = shares / views
+        save_rate = saves / views
+        comment_rate = comments / views
+        click_rate = clicks / views
+
+        # Define signal weights
+        weights = {
+            "engagement_rate": 0.30,  # Overall engagement still matters
+            "share_rate": 0.25,       # Shares indicate viral potential
+            "save_rate": 0.20,        # Saves indicate value/usefulness
+            "comment_rate": 0.15,     # Comments indicate discussion quality
+            "click_rate": 0.10,       # Clicks indicate interest
+        }
+
+        signals = {
+            "engagement_rate": engagement_rate,
+            "share_rate": share_rate,
+            "save_rate": save_rate,
+            "comment_rate": comment_rate,
+            "click_rate": click_rate,
+        }
+
+        composite = 0.0
+        for signal_name, value in signals.items():
+            benchmark = benchmarks.get(signal_name, 0.01)
+            # Normalize: benchmark = 1.0 score, double benchmark = 1.0 (capped)
+            normalized = min(1.0, value / benchmark) if benchmark > 0 else 0.0
+            weight = weights.get(signal_name, 0.1)
+            composite += normalized * weight
+
+        return min(1.0, composite)
+
+    async def _get_skill_baselines(self, skill_names: list[str]) -> dict[str, float]:
+        """Get historical success rate (baseline) for each skill.
+
+        Returns a dict mapping skill_name -> average score from recent outcomes.
+        Skills with no history default to 0.5.
+        """
+        baselines = {}
+        lookback_days = 30
+
+        async with async_session() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+            for skill_name in skill_names:
+                result = await session.execute(
+                    select(func.avg(SkillMetric.score))
+                    .where(SkillMetric.skill_name == skill_name)
+                    .where(SkillMetric.recorded_at >= cutoff)
+                    .where(SkillMetric.agent == "tracker")  # Only engagement-based metrics
+                )
+                avg_score = result.scalar()
+
+                if avg_score is not None:
+                    baselines[skill_name] = float(avg_score)
+                else:
+                    # No historical data - check skill's current confidence
+                    skill_manager = _get_skill_manager()
+                    skill = skill_manager.get_skill(skill_name)
+                    if skill:
+                        baselines[skill_name] = skill.confidence
+                    else:
+                        baselines[skill_name] = 0.5
+
+        return baselines
