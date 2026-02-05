@@ -1,12 +1,12 @@
 import logging
-import os
 import time
 import traceback
 from datetime import datetime, timezone
 
-from config import settings
 from db import async_session
 from models import ContentAgentRun
+from providers.factory import get_llm_provider
+from providers.llm.base import LLMProvider
 from skills.manager import SkillManager
 
 # Module-level SkillManager so skills are loaded once and shared
@@ -21,46 +21,33 @@ def _get_skill_manager() -> SkillManager:
     return _skill_manager
 
 
-def _make_boto3_client():
-    """Create a boto3 bedrock-runtime client with bearer token auth."""
-    import boto3
-
-    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = settings.aws_bearer_token_bedrock
-    # Clear IAM keys from env so boto3 picks up the bearer token instead
-    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "AWS_SESSION_TOKEN"):
-        os.environ.pop(key, None)
-    return boto3.client("bedrock-runtime", region_name=settings.aws_region)
-
-
-def _make_anthropic_client():
-    """Create an AnthropicBedrock client for SigV4 (IAM key) auth."""
-    from anthropic import AnthropicBedrock
-
-    if settings.aws_access_key_id and settings.aws_secret_access_key:
-        return AnthropicBedrock(
-            aws_region=settings.aws_region,
-            aws_access_key=settings.aws_access_key_id,
-            aws_secret_key=settings.aws_secret_access_key,
-        )
-    return AnthropicBedrock(aws_region=settings.aws_region)
-
-
 class BaseAgent:
     def __init__(self, name: str):
         self.name = name
         self.logger = logging.getLogger(f"agent.{name}")
+        self._llm_provider: LLMProvider | None = None
+
+    @property
+    def llm_provider(self) -> LLMProvider:
+        """Get the configured LLM provider (lazy initialization)."""
+        if self._llm_provider is None:
+            self._llm_provider = get_llm_provider()
+        return self._llm_provider
 
     def select_skills(self, task_type: str, platform: str | None = None) -> list:
         return _get_skill_manager().get_for_task(task_type=task_type, platform=platform)
 
-    async def call_bedrock(
+    async def call_llm(
         self,
         system_prompt: str,
         user_prompt: str,
         skills: list | None = None,
         max_tokens: int = 4096,
     ) -> str:
-        """Call Bedrock and return the response text. Also logs the run to DB."""
+        """Call the configured LLM provider and return the response text.
+
+        Also logs the run to DB with cost tracking.
+        """
         # Inject skills into system prompt
         full_system = system_prompt
         if skills:
@@ -69,22 +56,13 @@ class BaseAgent:
 
         start = time.time()
         try:
-            if settings.aws_bearer_token_bedrock:
-                # Bearer token auth — AnthropicBedrock doesn't support it
-                # (it only does SigV4), so use boto3 converse API directly.
-                content_text, input_tokens, output_tokens = self._call_via_boto3(
-                    full_system, user_prompt, max_tokens
-                )
-            else:
-                # IAM key auth — use AnthropicBedrock SDK.
-                content_text, input_tokens, output_tokens = self._call_via_anthropic(
-                    full_system, user_prompt, max_tokens
-                )
+            response = await self.llm_provider.complete(
+                system_prompt=full_system,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            )
 
             duration = time.time() - start
-
-            # Estimate cost (Claude Sonnet via Bedrock ballpark)
-            est_cost = (input_tokens * 3.0 + output_tokens * 15.0) / 1_000_000
 
             # Log to content_agent_runs table
             try:
@@ -92,11 +70,12 @@ class BaseAgent:
                     run = ContentAgentRun(
                         agent=self.name,
                         task=None,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        estimated_cost_usd=est_cost,
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        estimated_cost_usd=response.cost_usd,
                         duration_seconds=round(duration, 2),
                         status="completed",
+                        provider=response.provider,
                         started_at=datetime.now(timezone.utc),
                         completed_at=datetime.now(timezone.utc),
                     )
@@ -105,42 +84,24 @@ class BaseAgent:
             except Exception:
                 self.logger.warning("Failed to log agent run to database", exc_info=True)
 
-            return content_text
+            return response.text
 
         except Exception as e:
-            self.logger.error("Bedrock call failed: %s\n%s", e, traceback.format_exc())
+            self.logger.error("LLM call failed: %s\n%s", e, traceback.format_exc())
             raise
 
-    def _call_via_boto3(
-        self, system_prompt: str, user_prompt: str, max_tokens: int
-    ) -> tuple[str, int, int]:
-        """Call Bedrock using boto3 converse API (supports bearer token auth)."""
-        client = _make_boto3_client()
-        response = client.converse(
-            modelId=settings.bedrock_model_id,
-            system=[{"text": system_prompt}],
-            messages=[{"role": "user", "content": [{"text": user_prompt}]}],
-            inferenceConfig={"maxTokens": max_tokens},
-        )
-        content_text = response["output"]["message"]["content"][0]["text"]
-        usage = response.get("usage", {})
-        input_tokens = usage.get("inputTokens", 0)
-        output_tokens = usage.get("outputTokens", 0)
-        return content_text, input_tokens, output_tokens
+    async def call_bedrock(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        skills: list | None = None,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Call the LLM provider (deprecated, use call_llm instead).
 
-    def _call_via_anthropic(
-        self, system_prompt: str, user_prompt: str, max_tokens: int
-    ) -> tuple[str, int, int]:
-        """Call Bedrock using AnthropicBedrock SDK (SigV4 / IAM key auth)."""
-        client = _make_anthropic_client()
-        response = client.messages.create(
-            model=settings.bedrock_model_id,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        content_text = response.content[0].text if response.content else ""
-        return content_text, response.usage.input_tokens, response.usage.output_tokens
+        This method is kept for backwards compatibility.
+        """
+        return await self.call_llm(system_prompt, user_prompt, skills, max_tokens)
 
     def record_outcome(
         self,

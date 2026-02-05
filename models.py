@@ -97,6 +97,7 @@ class ContentMetric(Base):
     likes = Column(Integer, default=0)
     comments = Column(Integer, default=0)
     shares = Column(Integer, default=0)
+    saves = Column(Integer, default=0)  # Bookmarks/saves (indicates value)
     clicks = Column(Integer, default=0)
     followers_gained = Column(Integer, default=0)
     engagement_rate = Column(Float, default=0.0)
@@ -149,6 +150,7 @@ class ContentAgentRun(Base):
     estimated_cost_usd = Column(Float, default=0.0)
     duration_seconds = Column(Float, default=0.0)
     status = Column(String(32), default="completed")  # completed / failed / timeout
+    provider = Column(String(32), nullable=True, index=True)  # bedrock / ollama / openai_compat
     error = Column(Text, nullable=True)
     started_at = Column(DateTime, default=_utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
@@ -190,3 +192,26 @@ class SkillMetric(Base):
     score = Column(Float, default=0.0)
     context = Column(JSON, nullable=True)  # extra metadata
     recorded_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class SkillInteraction(Base):
+    """Track skill co-occurrence outcomes to discover synergies and conflicts.
+
+    When two skills are used together, this table records how they perform
+    relative to their individual baselines. Positive synergy_score indicates
+    the combination works better than expected; negative indicates conflict.
+    """
+
+    __tablename__ = "skill_interactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_a = Column(String(128), nullable=False, index=True)
+    skill_b = Column(String(128), nullable=False, index=True)
+    co_occurrence_count = Column(Integer, default=0)
+    avg_combined_score = Column(Float, default=0.0)
+    # synergy_score: combined score - (avg of individual scores)
+    # positive = skills amplify each other
+    # negative = skills conflict
+    synergy_score = Column(Float, default=0.0)
+    last_used_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, nullable=False)

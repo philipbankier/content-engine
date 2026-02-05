@@ -1,8 +1,9 @@
-"""Text content generation via Claude on AWS Bedrock."""
+"""Text content generation via configurable LLM provider."""
 
 import logging
-from anthropic import AnthropicBedrock
-from config import settings
+
+from providers.factory import get_llm_provider
+from providers.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +18,14 @@ Style rules:
 
 
 class TextGenerator:
-    def __init__(self):
-        self.client = AnthropicBedrock(
-            aws_region=settings.aws_region,
-            aws_access_key=settings.aws_access_key_id,
-            aws_secret_key=settings.aws_secret_access_key,
-        )
-        self.model = settings.bedrock_model_id
+    def __init__(self, provider: LLMProvider | None = None):
+        self._provider = provider
+
+    @property
+    def provider(self) -> LLMProvider:
+        if self._provider is None:
+            self._provider = get_llm_provider()
+        return self._provider
 
     async def generate(
         self,
@@ -32,24 +34,36 @@ class TextGenerator:
         max_tokens: int = 4096,
         skills_context: str = "",
     ) -> dict:
-        """Generate text content. Returns {"text": ..., "input_tokens": ..., "output_tokens": ...}."""
+        """Generate text content.
+
+        Returns:
+            dict with keys: text, input_tokens, output_tokens, provider, cost_usd
+            On error: includes "error" key
+        """
         system = system_prompt or f"You are a content creator for Autopilot by Kairox AI.\n\n{BRAND_VOICE}"
         if skills_context:
             system += f"\n\n## Relevant Skills\n{skills_context}"
 
         try:
-            response = self.client.messages.create(
-                model=self.model,
+            response = await self.provider.complete(
+                system_prompt=system,
+                user_prompt=prompt,
                 max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
             )
-            text = response.content[0].text if response.content else ""
             return {
-                "text": text,
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "text": response.text,
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "provider": response.provider,
+                "cost_usd": response.cost_usd,
             }
         except Exception as e:
             logger.error("Text generation failed: %s", e)
-            return {"text": "", "input_tokens": 0, "output_tokens": 0, "error": str(e)}
+            return {
+                "text": "",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "provider": self.provider.provider_name,
+                "cost_usd": 0.0,
+                "error": str(e),
+            }
