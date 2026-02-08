@@ -16,6 +16,13 @@ from models import (
     ContentMetric, ContentExperiment, ContentAgentRun,
     ContentPlaybook, SkillRecord, SkillMetric, EngagementAction,
 )
+from render_hints import (
+    build_full_dashboard_hints,
+    build_skills_hint,
+    build_approval_hint,
+    build_media_hint,
+    build_comparison_hint,
+)
 from skills.manager import SkillManager
 from skills.evaluator import SkillEvaluator
 from config import settings
@@ -1314,20 +1321,45 @@ async def select_variant(creation_id: int):
 
         # Capture fields needed for video generation outside the session
         video_script = creation.video_script
+        video_type = creation.video_type
+        video_prompt = creation.video_prompt
+        video_composition = creation.video_composition
         creation_format = creation.format
         creation_platform = creation.platform
         creation_title = creation.title
         creation_body = creation.body
 
-    # Stage 2: trigger deferred video generation if video_script exists
+    # Extract image_url for image-to-video types
+    creation_media_urls = None
+    async with async_session() as session:
+        creation_obj = (await session.execute(
+            select(ContentCreation).where(ContentCreation.id == creation_id)
+        )).scalar_one_or_none()
+        if creation_obj:
+            creation_media_urls = creation_obj.media_urls
+
+    image_url = None
+    if creation_media_urls:
+        for media in creation_media_urls:
+            if isinstance(media, dict) and media.get("type") == "image":
+                image_url = media["url"]
+                break
+
+    # Stage 2: trigger deferred video generation if content has video fields
     video_triggered = False
-    if video_script and creation_format == "short":
+    has_video_content = video_script or video_prompt or video_composition
+    if has_video_content and video_type:
         import asyncio
         asyncio.create_task(_generate_video_for_creation(
-            creation_id, video_script, creation_platform, creation_title, creation_body
+            creation_id, video_type, video_script, video_prompt,
+            video_composition, creation_platform, creation_title, creation_body,
+            image_url=image_url,
         ))
         video_triggered = True
-        logger.info("Triggered deferred video generation for creation %d", creation_id)
+        logger.info(
+            "Triggered deferred video generation (%s) for creation %d",
+            video_type, creation_id,
+        )
 
     return {
         "status": "approved",
@@ -1338,60 +1370,43 @@ async def select_variant(creation_id: int):
 
 
 async def _generate_video_for_creation(
-    creation_id: int, video_script: str, platform: str, title: str, body: str
+    creation_id: int,
+    video_type: str,
+    video_script: str | None,
+    video_prompt: str | None,
+    video_composition: list | None,
+    platform: str,
+    title: str,
+    body: str,
+    image_url: str | None = None,
 ):
-    """Background task: generate video for an approved creation and update media_urls."""
-    from config import settings
+    """Background task: generate video via VideoRouter and update media_urls."""
+    from generators.video_router import VideoRouter
+    from generators.video_types import VideoType
 
-    orientation = "portrait" if platform in ("tiktok", "youtube") else "landscape"
-    video_result = None
+    router = VideoRouter()
+    video_result = await router.generate(
+        video_type=VideoType.from_string(video_type),
+        video_script=video_script,
+        video_prompt=video_prompt,
+        video_composition=video_composition,
+        platform=platform,
+        title=title,
+        body=body,
+        image_url=image_url,
+    )
 
-    # 1. HeyGen Video Agent
-    if settings.heygen_api_key and settings.heygen_video_agent_enabled:
-        try:
-            from generators.video_heygen_agent import HeyGenVideoAgentGenerator
-            body_preview = (body or "")[:200]
-            agent_prompt = (
-                f"Create a short-form video for {platform}.\n"
-                f"Topic: {title}\n"
-                f"Context: {body_preview}\n"
-                f"Script: {video_script}\n"
-                f"Style: Professional, direct-to-camera, confident tone."
-            )
-            result = await HeyGenVideoAgentGenerator().generate(
-                prompt=agent_prompt, duration_sec=60, orientation=orientation,
-            )
-            if result.get("video_url"):
-                video_result = {"type": "video", "url": result["video_url"], "source": "heygen_agent"}
-                logger.info("Deferred video generated (Video Agent) for creation %d", creation_id)
-        except Exception as e:
-            logger.warning("Deferred Video Agent error for creation %d: %s", creation_id, e)
-
-    # 2. HeyGen v2 fallback
-    if not video_result and settings.heygen_api_key and settings.heygen_avatar_id_founder:
-        try:
-            from generators.video_heygen import HeyGenVideoGenerator
-            result = await HeyGenVideoGenerator().generate(script=video_script, avatar_type="founder")
-            if result.get("video_url"):
-                video_result = {"type": "video", "url": result["video_url"], "source": "heygen_v2"}
-                logger.info("Deferred video generated (HeyGen v2) for creation %d", creation_id)
-        except Exception as e:
-            logger.warning("Deferred HeyGen v2 error for creation %d: %s", creation_id, e)
-
-    # 3. Veo3 fallback
-    if not video_result and settings.fal_key:
-        try:
-            from generators.video_veo3 import Veo3VideoGenerator
-            result = await Veo3VideoGenerator().generate(prompt=video_script)
-            if result.get("video_url"):
-                video_result = {"type": "video", "url": result["video_url"], "source": "veo3"}
-                logger.info("Deferred video generated (Veo3) for creation %d", creation_id)
-        except Exception as e:
-            logger.warning("Deferred Veo3 error for creation %d: %s", creation_id, e)
-
-    if not video_result:
-        logger.warning("All video generators failed for creation %d", creation_id)
+    if video_result.get("error"):
+        logger.warning(
+            "Video generation failed for creation %d (%s): %s",
+            creation_id, video_type, video_result["error"],
+        )
         return
+
+    logger.info(
+        "Deferred video generated (%s via %s) for creation %d",
+        video_type, video_result.get("source", "unknown"), creation_id,
+    )
 
     # Update creation media_urls in DB
     from sqlalchemy.orm.attributes import flag_modified
@@ -2019,3 +2034,181 @@ async def get_engagement_stats():
         "proactive_daily_limit": settings.engagement_max_proactive_per_day,
         "proactive_remaining": max(0, settings.engagement_max_proactive_per_day - proactive_today),
     }
+
+
+# ── Render hints endpoint (for main platform integration) ────
+
+
+@router.get("/dashboard/render-hints")
+async def get_dashboard_render_hints():
+    """Return a full dashboard payload with render_hints for SmartRenderer.
+
+    This endpoint is designed to be called by the main platform's autopilot
+    proxy to populate result_data.render_hints on AutomatedJobResult records.
+    """
+    # Gather all data needed for the dashboard
+    pipeline_status = None
+    if _orchestrator:
+        pipeline_status = _orchestrator.get_status()
+
+    # Counts
+    async with async_session() as session:
+        discoveries = (await session.execute(select(func.count(ContentDiscovery.id)))).scalar() or 0
+        creations = (await session.execute(select(func.count(ContentCreation.id)))).scalar() or 0
+        publications = (await session.execute(select(func.count(ContentPublication.id)))).scalar() or 0
+
+        # Cost today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cost_result = await session.execute(
+            select(func.coalesce(func.sum(ContentAgentRun.estimated_cost_usd), 0.0))
+            .where(ContentAgentRun.started_at >= today_start)
+        )
+        cost_today = cost_result.scalar() or 0.0
+
+        # Avg arbitrage
+        arb_result = await session.execute(
+            select(func.avg(ContentPublication.arbitrage_window_minutes))
+            .where(ContentPublication.arbitrage_window_minutes.isnot(None))
+        )
+        avg_arbitrage = arb_result.scalar() or 0.0
+
+        # Pending approval
+        pending_result = await session.execute(
+            select(ContentCreation)
+            .where(ContentCreation.approval_status.in_(["pending", "pending_review"]))
+            .order_by(desc(ContentCreation.created_at))
+        )
+        pending_items = pending_result.scalars().all()
+
+    counts = {"discoveries": discoveries, "creations": creations, "publications": publications}
+
+    # Skills
+    skills_data = []
+    if _skill_manager:
+        evaluator = SkillEvaluator()
+        for s in _skill_manager.all_skills():
+            skills_data.append({
+                "name": s.name,
+                "confidence": round(s.confidence, 2),
+                "total_uses": s.total_uses,
+                "health": evaluator.check_health(s),
+            })
+
+    # Format pending approval
+    pending_approval = {
+        "ungrouped": [
+            {
+                "id": c.id,
+                "title": c.title,
+                "platform": c.platform,
+                "format": c.format,
+            }
+            for c in pending_items if not c.variant_group
+        ],
+        "variant_groups": [],
+        "total": len(pending_items),
+    }
+
+    # Build render hints
+    hints = build_full_dashboard_hints(
+        pipeline_status=pipeline_status,
+        counts=counts,
+        skills=skills_data,
+        pending_approval=pending_approval,
+        cost_today=cost_today,
+        daily_limit=settings.daily_cost_limit,
+        avg_arbitrage=avg_arbitrage,
+    )
+
+    return {
+        "render_hints": hints,
+        "result_summary": (
+            f"Content pipeline: {discoveries} discoveries, {creations} created, "
+            f"{publications} published. {len(pending_items)} pending approval."
+        ),
+    }
+
+
+# ── Smoke test endpoints ─────────────────────────────────────
+
+# In-memory storage for smoke test runs (fine for single-process demo)
+_smoke_test_runs: dict[str, dict] = {}
+
+
+@router.post("/smoke-test")
+async def start_smoke_test(
+    type: str | None = None,
+    dry_run: bool = False,
+):
+    """Kick off an end-to-end smoke test of video generators.
+
+    Returns a run_id to poll for results. Video generation can take 5-20 min per type.
+
+    Args:
+        type: Optional single video type to test (e.g. "cinematic_broll")
+        dry_run: If True, show plan + costs without calling APIs
+    """
+    import uuid
+
+    run_id = str(uuid.uuid4())[:8]
+    types_filter = [type] if type else None
+
+    _smoke_test_runs[run_id] = {
+        "status": "started",
+        "dry_run": dry_run,
+        "types_filter": types_filter,
+        "video_results": [],
+        "format_results": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+    }
+
+    async def _run_smoke_test():
+        from scripts.smoke_test import (
+            run_video_smoke_test,
+            run_content_format_test,
+            check_prerequisites,
+        )
+
+        entry = _smoke_test_runs[run_id]
+        try:
+            entry["status"] = "running"
+            entry["prerequisites"] = check_prerequisites()
+
+            video_results = await run_video_smoke_test(
+                types_filter=types_filter, dry_run=dry_run,
+            )
+            entry["video_results"] = video_results
+
+            if not dry_run:
+                entry["format_results"] = run_content_format_test()
+
+            entry["status"] = "completed"
+        except Exception as e:
+            entry["status"] = "failed"
+            entry["error"] = str(e)
+            logger.error("Smoke test %s failed: %s", run_id, traceback.format_exc())
+        finally:
+            entry["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+    import asyncio
+    asyncio.create_task(_run_smoke_test())
+
+    return {
+        "run_id": run_id,
+        "status": "started",
+        "dry_run": dry_run,
+        "poll_url": f"/smoke-test/{run_id}",
+    }
+
+
+@router.get("/smoke-test/{run_id}")
+async def get_smoke_test_status(run_id: str):
+    """Poll for smoke test results.
+
+    Returns current status and any results collected so far.
+    """
+    entry = _smoke_test_runs.get(run_id)
+    if not entry:
+        raise HTTPException(404, f"Smoke test run '{run_id}' not found")
+    return entry
