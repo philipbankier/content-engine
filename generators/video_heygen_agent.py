@@ -28,15 +28,24 @@ class HeyGenVideoAgentGenerator:
         duration_sec: int = 60,
         orientation: str = "portrait",
         avatar_id: str | None = None,
+        test_mode: bool = False,
     ) -> dict:
         """Generate a video from a rich text prompt using the Video Agent.
 
         The Video Agent handles script writing, avatar selection, visual
         composition, voiceover, pacing, and captions automatically.
 
+        Args:
+            test_mode: If True, pass "test": true to HeyGen — produces
+                       watermarked output at zero credit cost.
+
         Returns {"video_url": url, "video_id": id} or {"error": msg}.
         """
         body: dict = {"prompt": prompt}
+
+        if test_mode:
+            body["test"] = True
+            logger.info("HeyGen Video Agent: test_mode=True — watermarked output, zero credits")
 
         config: dict = {}
         if duration_sec:

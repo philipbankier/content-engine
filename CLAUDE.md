@@ -238,6 +238,33 @@ These skills are designed to visibly evolve during the demo:
 4. After task execution, agent calls `skill_manager.record_outcome(skill_name, outcome)`
 5. SkillManager updates confidence scores
 
+## Testing
+
+### Running Tests
+```bash
+pip install -e ".[dev]"   # installs pytest, pytest-asyncio, ruff
+pytest -v                  # full suite
+pytest tests/test_video_types.py -v   # single file
+pytest --co                # collect-only: list tests without running
+```
+
+### Conventions
+- Test files live in `tests/` and are named `test_<module>.py`
+- Test classes are `TestFeatureName`, test functions are `test_expected_behavior`
+- `asyncio_mode = "auto"` in pyproject.toml — no `@pytest.mark.asyncio` decorator needed
+- All external APIs (HeyGen, fal.ai, Bedrock, Veo3) **must be mocked** — tests run offline
+- Use `mock_db` fixture for DB tests (in-memory SQLite), `mock_settings` to avoid .env reads
+- Generator mocks: `mock_heygen`, `mock_heygen_agent`, `mock_veo3`, `mock_kling`
+
+### Test-on-Change Rule
+When modifying source files, update the corresponding test files:
+- `generators/video_types.py` → `tests/test_video_types.py`
+- `generators/video_router.py` → `tests/test_video_router.py`
+- `generators/video_kling.py` → `tests/test_video_kling.py`
+- `skills/manager.py` → `tests/test_skill_manager.py`
+- `agents/creator.py` → `tests/test_creator.py`
+- `routes.py` (approval flow) → `tests/test_routes_approval.py`
+
 ## Demo Data Seeding
 
 Before running the demo for investors, seed the database with 14 days of realistic historical data:

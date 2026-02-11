@@ -64,6 +64,14 @@ class ContentCreation(Base):
     quality_score = Column(Float, nullable=True)  # 0-1 quality score from QualityChecker
     quality_issues = Column(JSON, nullable=True)  # list of quality issues found
     video_script = Column(Text, nullable=True)  # stored for deferred video generation
+    video_type = Column(String(32), nullable=True)  # VideoType enum value
+    video_type_rationale = Column(Text, nullable=True)
+    video_prompt = Column(Text, nullable=True)  # for non-script video types (motion_graphics, kinetic_text, avatar_agent)
+    video_composition = Column(JSON, nullable=True)  # for hybrid: list of segment dicts
+    video_status = Column(String(32), default="idle")  # idle / generating / done / failed
+    video_url = Column(Text, nullable=True)
+    video_error = Column(Text, nullable=True)
+    video_started_at = Column(DateTime, nullable=True)
     variant_group = Column(String(64), nullable=True, index=True)
     variant_label = Column(String(8), nullable=True)  # A, B, C
     approval_status = Column(String(32), default="pending")  # pending / pending_review / approved / rejected / auto_approved / quality_rejected
@@ -235,3 +243,61 @@ class EngagementAction(Base):
     posted_at = Column(DateTime, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class ContentSchedule(Base):
+    """Scheduled content publications — approved content queued for future publish."""
+
+    __tablename__ = "content_schedules"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    creation_id = Column(Integer, nullable=False, index=True)
+    platform = Column(String(32), nullable=False, index=True)
+    scheduled_at = Column(DateTime, nullable=False, index=True)
+    status = Column(String(32), default="scheduled", index=True)  # scheduled / published / cancelled / failed
+    suggested_by = Column(String(32), default="system")  # system / user
+    publication_id = Column(Integer, nullable=True)  # Set after publish
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    published_at = Column(DateTime, nullable=True)
+
+
+class NewsletterDraft(Base):
+    """Curated newsletter drafts with topic sections."""
+
+    __tablename__ = "newsletter_drafts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(Text, nullable=False)
+    sections = Column(JSON, nullable=True)  # [{heading, summary, discovery_ids, image_url}]
+    html_body = Column(Text, nullable=True)
+    header_image_url = Column(Text, nullable=True)
+    status = Column(String(32), default="draft", index=True)  # draft / approved / sent
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    approved_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+
+
+class VideoCreation(Base):
+    """Dedicated short-form video content (TikTok, Reels, Shorts)."""
+
+    __tablename__ = "video_creations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    discovery_id = Column(Integer, nullable=True, index=True)
+    title = Column(Text, nullable=False)
+    script = Column(Text, nullable=True)
+    video_type = Column(String(32), nullable=True)
+    video_prompt = Column(Text, nullable=True)
+    video_composition = Column(JSON, nullable=True)
+    thumbnail_prompt = Column(Text, nullable=True)
+    caption = Column(Text, nullable=True)
+    hashtags = Column(JSON, nullable=True)
+    target_platforms = Column(JSON, nullable=True)  # ["tiktok", "youtube_shorts", "reels"]
+    video_url = Column(Text, nullable=True)
+    thumbnail_url = Column(Text, nullable=True)
+    video_status = Column(String(32), default="pending", index=True)  # pending / generating / done / failed
+    approval_status = Column(String(32), default="pending", index=True)  # pending / approved / rejected
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    approved_at = Column(DateTime, nullable=True)

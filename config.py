@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     heygen_api_key: str = ""
     heygen_avatar_id_founder: str = ""
     heygen_avatar_id_professional: str = ""
+    heygen_voice_id: str = ""  # Default voice for TTS; if empty, fetched from avatar details
     heygen_video_agent_enabled: bool = True
 
     # ===== COGVIDEOX (Local Video - Experimental) =====

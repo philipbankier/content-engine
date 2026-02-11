@@ -24,23 +24,57 @@ class HeyGenVideoGenerator:
             return settings.heygen_avatar_id_professional
         return settings.heygen_avatar_id_founder
 
+    async def _resolve_voice_id(
+        self, avatar_id: str, voice_id: str | None,
+    ) -> str | None:
+        """Resolve voice_id: explicit > config > avatar default."""
+        if voice_id:
+            return voice_id
+        if settings.heygen_voice_id:
+            return settings.heygen_voice_id
+        # Fetch avatar's default voice
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{self.base_url}/v2/avatars",
+                    headers=self.headers,
+                )
+                resp.raise_for_status()
+                for av in resp.json().get("data", {}).get("avatars", []):
+                    if av.get("avatar_id") == avatar_id:
+                        vid = av.get("default_voice_id")
+                        if vid:
+                            logger.info("Using avatar default voice: %s", vid)
+                            return vid
+        except Exception as e:
+            logger.warning("Could not fetch avatar default voice: %s", e)
+        return None
+
     async def generate(
         self,
         script: str,
         avatar_type: str = "founder",
         voice_id: str | None = None,
+        test_mode: bool = False,
     ) -> dict:
         """Generate a video with a HeyGen avatar speaking the given script.
+
+        Args:
+            test_mode: If True, pass "test": true to HeyGen — produces
+                       watermarked output at zero credit cost.
 
         Returns {"video_url": url, "video_id": id} or {"error": msg}.
         """
         avatar_id = self._get_avatar_id(avatar_type)
+        resolved_voice = await self._resolve_voice_id(avatar_id, voice_id)
+        if not resolved_voice:
+            return {"error": "No voice_id available — set HEYGEN_VOICE_ID or ensure avatar has a default voice"}
+
         voice_config: dict = {
             "type": "text",
             "input_text": script,
+            "voice_id": resolved_voice,
         }
-        if voice_id:
-            voice_config["voice_id"] = voice_id
 
         body = {
             "video_inputs": [
@@ -53,10 +87,14 @@ class HeyGenVideoGenerator:
                 }
             ],
             "dimension": {
-                "width": 1080,
-                "height": 1920,
+                "width": 720,
+                "height": 1280,
             },
         }
+
+        if test_mode:
+            body["test"] = True
+            logger.info("HeyGen v2: test_mode=True — watermarked output, zero credits")
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:

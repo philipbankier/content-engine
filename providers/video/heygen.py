@@ -52,6 +52,31 @@ class HeyGenProvider(VideoProvider):
             return self.avatar_id_professional
         return self.avatar_id_founder
 
+    async def _resolve_voice_id(
+        self, avatar_id: str, voice_id: str | None,
+    ) -> str | None:
+        """Resolve voice_id: explicit > config > avatar default."""
+        if voice_id:
+            return voice_id
+        if settings.heygen_voice_id:
+            return settings.heygen_voice_id
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{self.base_url}/v2/avatars",
+                    headers=self._get_headers(),
+                )
+                resp.raise_for_status()
+                for av in resp.json().get("data", {}).get("avatars", []):
+                    if av.get("avatar_id") == avatar_id:
+                        vid = av.get("default_voice_id")
+                        if vid:
+                            logger.info("Using avatar default voice: %s", vid)
+                            return vid
+        except Exception as e:
+            logger.warning("Could not fetch avatar default voice: %s", e)
+        return None
+
     async def generate(
         self,
         script: str,
@@ -73,12 +98,22 @@ class HeyGenProvider(VideoProvider):
                 cost_usd=0.0,
             )
 
+        resolved_voice = await self._resolve_voice_id(avatar_id, voice_id)
+        if not resolved_voice:
+            return VideoResult(
+                video_url=None,
+                local_path=None,
+                video_id=None,
+                error="No voice_id available — set HEYGEN_VOICE_ID or ensure avatar has a default voice",
+                provider=self.provider_name,
+                cost_usd=0.0,
+            )
+
         voice_config: dict = {
             "type": "text",
             "input_text": script,
+            "voice_id": resolved_voice,
         }
-        if voice_id:
-            voice_config["voice_id"] = voice_id
 
         body = {
             "video_inputs": [
@@ -91,8 +126,8 @@ class HeyGenProvider(VideoProvider):
                 }
             ],
             "dimension": {
-                "width": 1080,
-                "height": 1920,
+                "width": 720,
+                "height": 1280,
             },
         }
 

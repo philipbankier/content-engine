@@ -29,14 +29,38 @@ async def _ensure_indexes(conn):
             )
 
 
+# Columns that may need adding to existing tables (schema drift from new features)
+# Format: (table_name, column_name, column_type, default)
+REQUIRED_COLUMNS = [
+    ("content_creations", "video_status", "VARCHAR(32)", "'idle'"),
+    ("content_creations", "video_url", "TEXT", "NULL"),
+    ("content_creations", "video_error", "TEXT", "NULL"),
+    ("content_creations", "video_started_at", "DATETIME", "NULL"),
+]
+
+
+async def _ensure_columns(conn):
+    """Add missing columns to existing tables (SQLite ALTER TABLE ADD COLUMN)."""
+    for table_name, col_name, col_type, default in REQUIRED_COLUMNS:
+        # Check if column exists via PRAGMA
+        result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+        columns = [row[1] for row in result.fetchall()]
+        if col_name not in columns:
+            default_clause = f" DEFAULT {default}" if default != "NULL" else ""
+            await conn.execute(
+                text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}{default_clause}")
+            )
+
+
 async def create_tables():
     """Create all tables defined in models.py and ensure indexes exist."""
     from models import Base
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Fix schema drift: create any missing indexes
+        # Fix schema drift: create any missing indexes and columns
         await _ensure_indexes(conn)
+        await _ensure_columns(conn)
 
 
 async def get_session() -> AsyncSession:

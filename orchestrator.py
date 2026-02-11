@@ -19,7 +19,7 @@ from skills.manager import SkillManager
 from config import settings
 from db import async_session
 from sqlalchemy import select, func
-from models import ContentAgentRun
+from models import ContentAgentRun, ContentSchedule, ContentCreation, ContentPublication
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,7 @@ class Orchestrator:
             asyncio.create_task(self._loop("engagement", self._engagement_cycle, interval=settings.engagement_interval)),
             asyncio.create_task(self._loop("feedback", self._feedback_cycle, interval=settings.feedback_interval)),
             asyncio.create_task(self._loop("reviewer", self._review_cycle, interval=settings.reviewer_interval)),
+            asyncio.create_task(self._loop("scheduler", self._publish_scheduled, interval=300)),  # every 5 min
         ]
         logger.info("Orchestrator started with %d scheduled loops", len(self._tasks))
 
@@ -255,6 +256,57 @@ class Orchestrator:
                 len(decayed),
                 {k: f"-{v:.3f}" for k, v in decayed.items()}
             )
+
+    async def _publish_scheduled(self):
+        """Publish any scheduled content that is due."""
+        now = datetime.now(timezone.utc)
+        async with async_session() as session:
+            result = await session.execute(
+                select(ContentSchedule)
+                .where(ContentSchedule.status == "scheduled")
+                .where(ContentSchedule.scheduled_at <= now)
+            )
+            due_items = result.scalars().all()
+
+            if not due_items:
+                return
+
+            logger.info("Publishing %d scheduled items", len(due_items))
+
+            for schedule in due_items:
+                try:
+                    # Get the creation
+                    creation = (await session.execute(
+                        select(ContentCreation).where(ContentCreation.id == schedule.creation_id)
+                    )).scalar_one_or_none()
+
+                    if not creation:
+                        schedule.status = "failed"
+                        schedule.error = "Creation not found"
+                        continue
+
+                    # Create publication record
+                    pub = ContentPublication(
+                        creation_id=schedule.creation_id,
+                        platform=schedule.platform,
+                    )
+                    session.add(pub)
+                    await session.flush()
+
+                    schedule.status = "published"
+                    schedule.publication_id = pub.id
+                    schedule.published_at = now
+
+                    logger.info(
+                        "Published scheduled item %d (creation %d) to %s",
+                        schedule.id, schedule.creation_id, schedule.platform,
+                    )
+                except Exception as e:
+                    schedule.status = "failed"
+                    schedule.error = str(e)
+                    logger.error("Failed to publish schedule %d: %s", schedule.id, e)
+
+            await session.commit()
 
     async def trigger_scout(self) -> dict:
         """Manually trigger a scout cycle. Used by API."""

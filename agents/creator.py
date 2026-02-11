@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from agents.base import BaseAgent
 from db import async_session
+from generators.video_types import VideoType, should_generate_video, CONTENT_VIDEO_DEFAULTS
 from models import ContentCreation, ContentDiscovery
 
 logger = logging.getLogger(__name__)
@@ -201,11 +202,35 @@ class CreatorAgent(BaseAgent):
             }
             hint = style_hints.get(variant_label, "")
             user_prompt += f"This is variant {variant_label}. {hint} "
+        # Determine if this content should have video
+        wants_video = should_generate_video(fmt, platform)
+
         user_prompt += "Return JSON with keys: title, body, image_prompt"
-        if fmt == "short":
+        if wants_video:
+            # Load video format selection skill for the LLM to reason about video type
+            video_skills = self.select_skills("video_format_selection")
+            video_skills_text = self.format_skills_for_prompt(video_skills)
+            if video_skills_text:
+                system_prompt += f"\n\n{video_skills_text}"
+
             user_prompt += (
-                ", video_script (a 30-60 second spoken script for a talking-head video, "
-                "~75-150 words, conversational tone, direct-to-camera)"
+                ", video_type (one of: avatar_talking_head, avatar_agent, "
+                "motion_graphics, hybrid_avatar_broll, kinetic_text, "
+                "cinematic_broll, image_to_video, multi_shot_narrative — "
+                "choose the best format for this content and platform), "
+                "video_type_rationale (1-sentence explanation of your choice)"
+            )
+            user_prompt += (
+                ". Then include the fields needed for your chosen video_type: "
+                "if avatar_talking_head → video_script (30-60s spoken script, 75-150 words, conversational); "
+                "if avatar_agent → video_prompt (rich description of desired video); "
+                "if motion_graphics → video_prompt (cinematic visual description); "
+                "if hybrid_avatar_broll → video_composition (list of segment objects with "
+                "type 'avatar' or 'broll', plus 'script' or 'prompt' and 'duration' in seconds); "
+                "if kinetic_text → video_prompt (the text content + style description); "
+                "if cinematic_broll → video_prompt (cinematic scene with specific camera movements and physics); "
+                "if image_to_video → video_prompt (how to animate the generated image — describe motion, not scene); "
+                "if multi_shot_narrative → video_composition (list of 2-6 shot objects with 'prompt' and 'duration' in seconds)"
             )
 
         raw_response = await self.call_bedrock(
@@ -226,8 +251,24 @@ class CreatorAgent(BaseAgent):
         # --- Stage 1: generate images only (cheap). Video deferred to after approval. ---
         media_urls = await self._generate_images(content_data, platform, fmt)
 
-        # Save video_script for deferred generation after approval
-        video_script = content_data.get("video_script") if fmt == "short" else None
+        # Extract video fields — the LLM now decides video_type for all video-capable content
+        video_script = None
+        video_type = None
+        video_type_rationale = None
+        video_prompt = None
+        video_composition = None
+
+        if wants_video:
+            video_type_raw = content_data.get("video_type")
+            if video_type_raw:
+                video_type = VideoType.from_string(video_type_raw).value
+            else:
+                # Fallback: infer from content category
+                video_type = self._infer_video_type(discovery, platform)
+            video_type_rationale = content_data.get("video_type_rationale")
+            video_script = content_data.get("video_script")
+            video_prompt = content_data.get("video_prompt")
+            video_composition = content_data.get("video_composition")
 
         async with async_session() as session:
             creation = ContentCreation(
@@ -238,6 +279,10 @@ class CreatorAgent(BaseAgent):
                 body=content_data.get("body", ""),
                 media_urls=media_urls or None,
                 video_script=video_script,
+                video_type=video_type,
+                video_type_rationale=video_type_rationale,
+                video_prompt=video_prompt,
+                video_composition=video_composition,
                 skills_used=skills_used,
                 variant_group=variant_group,
                 variant_label=variant_label,
@@ -399,3 +444,27 @@ class CreatorAgent(BaseAgent):
         except Exception as e:
             logger.warning("Failed to build avoid guidance: %s", e)
             return ""
+
+    @staticmethod
+    def _infer_video_type(discovery: ContentDiscovery, platform: str) -> str:
+        """Fallback: infer video type from content signals when LLM doesn't decide."""
+        from generators.video_types import CONTENT_VIDEO_DEFAULTS, PLATFORM_VIDEO_PREFERENCES
+
+        # Try matching discovery suggested_formats to content keywords
+        formats = discovery.suggested_formats or []
+        if isinstance(formats, str):
+            try:
+                formats = json.loads(formats)
+            except (json.JSONDecodeError, TypeError):
+                formats = []
+
+        for fmt_hint in formats:
+            if fmt_hint in CONTENT_VIDEO_DEFAULTS:
+                return CONTENT_VIDEO_DEFAULTS[fmt_hint].value
+
+        # Fall back to platform default
+        prefs = PLATFORM_VIDEO_PREFERENCES.get(platform, [])
+        if prefs:
+            return prefs[0].value
+
+        return VideoType.AVATAR_AGENT.value

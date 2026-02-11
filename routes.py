@@ -15,6 +15,7 @@ from models import (
     ContentDiscovery, ContentCreation, ContentPublication,
     ContentMetric, ContentExperiment, ContentAgentRun,
     ContentPlaybook, SkillRecord, SkillMetric, EngagementAction,
+    ContentSchedule, NewsletterDraft, VideoCreation,
 )
 from render_hints import (
     build_full_dashboard_hints,
@@ -1258,6 +1259,9 @@ async def get_pending_approval():
     groups: dict[str, list] = {}
     ungrouped: list = []
 
+    # Group by discovery_id for burst detection
+    discovery_items: dict[int, list] = {}
+
     for c in items:
         entry = {
             "id": c.id,
@@ -1270,6 +1274,9 @@ async def get_pending_approval():
             "body": c.body,
             "media_urls": c.media_urls,
             "video_script": c.video_script,
+            "video_type": c.video_type,
+            "video_status": c.video_status or "idle",
+            "video_url": c.video_url,
             "variant_group": c.variant_group,
             "variant_label": c.variant_label,
             "risk_score": c.risk_score,
@@ -1281,12 +1288,32 @@ async def get_pending_approval():
         else:
             ungrouped.append(entry)
 
+        # Track by discovery for burst grouping
+        if c.discovery_id:
+            discovery_items.setdefault(c.discovery_id, []).append(entry)
+
+    # Build discovery bursts (discoveries with content on 2+ platforms)
+    discovery_bursts = []
+    burst_item_ids = set()
+    for disc_id, disc_items in discovery_items.items():
+        platforms = {item["platform"] for item in disc_items}
+        if len(platforms) >= 2:
+            discovery_bursts.append({
+                "discovery_id": disc_id,
+                "discovery_title": disc_titles.get(disc_id),
+                "platforms": sorted(platforms),
+                "items": disc_items,
+                "count": len(disc_items),
+            })
+            burst_item_ids.update(item["id"] for item in disc_items)
+
     return {
         "variant_groups": [
             {"group_id": gid, "variants": variants}
             for gid, variants in groups.items()
         ],
         "ungrouped": ungrouped,
+        "discovery_bursts": discovery_bursts,
         "total": len(items),
     }
 
@@ -2036,6 +2063,123 @@ async def get_engagement_stats():
     }
 
 
+# ── Activity feed (hydrates content thread on mount) ─────────
+
+
+@router.get("/activity-feed")
+async def get_activity_feed():
+    """Aggregated activity feed for chat-first thread hydration.
+
+    Returns pipeline status, pending approvals (first 3), recent publications
+    (last 24h), and a one-liner summary — all in a single request.
+    """
+    from datetime import timedelta
+
+    summary_parts = []
+
+    # Pipeline status
+    pipeline_status = None
+    if _orchestrator:
+        pipeline_status = _orchestrator.get_status()
+
+    # Counts from DB
+    async with async_session() as session:
+        discoveries = (await session.execute(select(func.count(ContentDiscovery.id)))).scalar() or 0
+        creations = (await session.execute(select(func.count(ContentCreation.id)))).scalar() or 0
+        publications_total = (await session.execute(select(func.count(ContentPublication.id)))).scalar() or 0
+
+        # Pending approvals (first 3)
+        pending_result = await session.execute(
+            select(ContentCreation)
+            .where(ContentCreation.approval_status.in_(["pending", "pending_review"]))
+            .order_by(desc(ContentCreation.created_at))
+            .limit(3)
+        )
+        pending_items = pending_result.scalars().all()
+        pending_count_result = await session.execute(
+            select(func.count(ContentCreation.id))
+            .where(ContentCreation.approval_status.in_(["pending", "pending_review"]))
+        )
+        pending_count = pending_count_result.scalar() or 0
+
+        # Batch-fetch discovery titles for pending items
+        disc_ids = list({c.discovery_id for c in pending_items if c.discovery_id})
+        disc_titles = {}
+        if disc_ids:
+            disc_result = await session.execute(
+                select(ContentDiscovery.id, ContentDiscovery.title)
+                .where(ContentDiscovery.id.in_(disc_ids))
+            )
+            disc_titles = {row.id: row.title for row in disc_result}
+
+        # Recent publications (last 24h)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_pubs_result = await session.execute(
+            select(ContentPublication)
+            .where(ContentPublication.published_at >= cutoff)
+            .order_by(desc(ContentPublication.published_at))
+            .limit(5)
+        )
+        recent_pubs = recent_pubs_result.scalars().all()
+
+    # Build summary
+    if pending_count > 0:
+        summary_parts.append(f"{pending_count} item{'s' if pending_count != 1 else ''} awaiting approval")
+    if recent_pubs:
+        summary_parts.append(f"{len(recent_pubs)} post{'s' if len(recent_pubs) != 1 else ''} published in the last 24h")
+    summary_parts.append(f"{discoveries} discoveries, {creations} creations, {publications_total} publications total")
+
+    summary = ". ".join(summary_parts) + "."
+
+    # Serialize pending items
+    pending_serialized = []
+    for c in pending_items:
+        pending_serialized.append({
+            "id": c.id,
+            "discovery_id": c.discovery_id,
+            "discovery_title": disc_titles.get(c.discovery_id),
+            "platform": c.platform,
+            "format": c.format,
+            "title": c.title,
+            "body_preview": (c.body or "")[:300],
+            "body": c.body,
+            "media_urls": c.media_urls,
+            "video_type": c.video_type,
+            "video_url": c.video_url,
+            "risk_score": c.risk_score,
+            "risk_flags": c.risk_flags,
+            "variant_label": c.variant_label,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "status": "pending",
+        })
+
+    # Serialize recent publications
+    recent_pubs_serialized = [
+        {
+            "id": p.id,
+            "platform": p.platform,
+            "platform_url": p.platform_url,
+            "published_at": p.published_at.isoformat() if p.published_at else None,
+        }
+        for p in recent_pubs
+    ]
+
+    return {
+        "summary": summary,
+        "pipeline": pipeline_status,
+        "counts": {
+            "discoveries": discoveries,
+            "creations": creations,
+            "publications": publications_total,
+        },
+        "pending": {
+            "total": pending_count,
+            "items": pending_serialized,
+        },
+        "recent_publications": recent_pubs_serialized,
+    }
+
+
 # ── Render hints endpoint (for main platform integration) ────
 
 
@@ -2127,6 +2271,913 @@ async def get_dashboard_render_hints():
             f"{publications} published. {len(pending_items)} pending approval."
         ),
     }
+
+
+# ── Phase 1.1: Video Preview ─────────────────────────────────
+
+
+class GenerateVideoRequest(BaseModel):
+    video_type_override: Optional[str] = None
+
+
+@router.post("/creations/{creation_id}/generate-video")
+async def generate_video_preview(creation_id: int, data: GenerateVideoRequest | None = None):
+    """Spawn async video generation for a creation. Returns immediately."""
+    async with async_session() as session:
+        creation = (await session.execute(
+            select(ContentCreation).where(ContentCreation.id == creation_id)
+        )).scalar_one_or_none()
+        if not creation:
+            raise HTTPException(404, f"Creation {creation_id} not found")
+        if creation.video_status == "generating":
+            return {"status": "already_generating", "id": creation_id}
+
+        creation.video_status = "generating"
+        creation.video_started_at = datetime.now(timezone.utc)
+        creation.video_error = None
+        await session.commit()
+
+        # Capture fields for background task
+        vtype = (data.video_type_override if data else None) or creation.video_type
+        vscript = creation.video_script
+        vprompt = creation.video_prompt
+        vcomp = creation.video_composition
+        platform = creation.platform
+        title = creation.title
+        body = creation.body
+        media_urls = creation.media_urls
+
+    image_url = None
+    if media_urls:
+        for media in media_urls:
+            if isinstance(media, dict) and media.get("type") == "image":
+                image_url = media["url"]
+                break
+
+    import asyncio
+    asyncio.create_task(_generate_video_preview(
+        creation_id, vtype, vscript, vprompt, vcomp, platform, title, body, image_url
+    ))
+
+    return {"status": "generating", "id": creation_id}
+
+
+async def _generate_video_preview(
+    creation_id: int,
+    video_type: str | None,
+    video_script: str | None,
+    video_prompt: str | None,
+    video_composition: list | None,
+    platform: str,
+    title: str,
+    body: str,
+    image_url: str | None = None,
+):
+    """Background: generate video and update creation record."""
+    try:
+        from generators.video_router import VideoRouter
+        from generators.video_types import VideoType
+
+        vt = VideoType.from_string(video_type) if video_type else VideoType.CINEMATIC_BROLL
+        router_inst = VideoRouter()
+        result = await router_inst.generate(
+            video_type=vt,
+            video_script=video_script,
+            video_prompt=video_prompt,
+            video_composition=video_composition,
+            platform=platform,
+            title=title,
+            body=body,
+            image_url=image_url,
+        )
+
+        from sqlalchemy.orm.attributes import flag_modified
+        async with async_session() as session:
+            creation = (await session.execute(
+                select(ContentCreation).where(ContentCreation.id == creation_id)
+            )).scalar_one_or_none()
+            if not creation:
+                return
+
+            if result.get("error"):
+                creation.video_status = "failed"
+                creation.video_error = result["error"]
+            else:
+                creation.video_status = "done"
+                creation.video_url = result.get("url") or result.get("local_path")
+                # Also append to media_urls
+                existing = list(creation.media_urls or [])
+                existing.append(result)
+                creation.media_urls = existing
+                flag_modified(creation, "media_urls")
+
+            await session.commit()
+
+    except Exception as e:
+        logger.error("Video preview gen failed for %d: %s", creation_id, e)
+        async with async_session() as session:
+            creation = (await session.execute(
+                select(ContentCreation).where(ContentCreation.id == creation_id)
+            )).scalar_one_or_none()
+            if creation:
+                creation.video_status = "failed"
+                creation.video_error = str(e)
+                await session.commit()
+
+
+@router.get("/creations/{creation_id}/video-status")
+async def get_video_status(creation_id: int):
+    """Poll video generation status."""
+    async with async_session() as session:
+        creation = (await session.execute(
+            select(ContentCreation).where(ContentCreation.id == creation_id)
+        )).scalar_one_or_none()
+        if not creation:
+            raise HTTPException(404, f"Creation {creation_id} not found")
+    return {
+        "id": creation_id,
+        "video_status": creation.video_status or "idle",
+        "video_url": creation.video_url,
+        "video_error": creation.video_error,
+        "video_started_at": creation.video_started_at.isoformat() if creation.video_started_at else None,
+    }
+
+
+# ── Phase 1.2: Image Generation ─────────────────────────────
+
+
+class GenerateImageRequest(BaseModel):
+    prompt: Optional[str] = None
+
+
+@router.post("/creations/{creation_id}/generate-image")
+async def generate_image_for_creation(creation_id: int, data: GenerateImageRequest | None = None):
+    """Generate an image for a creation. Synchronous (~5-10s for fal.ai)."""
+    async with async_session() as session:
+        creation = (await session.execute(
+            select(ContentCreation).where(ContentCreation.id == creation_id)
+        )).scalar_one_or_none()
+        if not creation:
+            raise HTTPException(404, f"Creation {creation_id} not found")
+
+        # Build prompt from content if not provided
+        prompt = data.prompt if data and data.prompt else None
+        if not prompt:
+            prompt = f"Professional social media graphic for: {creation.title or ''} - {(creation.body or '')[:200]}"
+
+    try:
+        from generators.image import ImageGenerator
+        gen = ImageGenerator()
+        result = await gen.generate(prompt=prompt, size="landscape_4_3", style="professional")
+
+        if result.get("error"):
+            raise HTTPException(500, f"Image generation failed: {result['error']}")
+
+        from sqlalchemy.orm.attributes import flag_modified
+        async with async_session() as session:
+            creation = (await session.execute(
+                select(ContentCreation).where(ContentCreation.id == creation_id)
+            )).scalar_one_or_none()
+            if creation:
+                existing = list(creation.media_urls or [])
+                existing.append({
+                    "type": "image",
+                    "url": result.get("url") or result.get("local_path"),
+                    "provider": result.get("provider"),
+                })
+                creation.media_urls = existing
+                flag_modified(creation, "media_urls")
+                await session.commit()
+
+        return {
+            "status": "done",
+            "id": creation_id,
+            "image_url": result.get("url") or result.get("local_path"),
+            "provider": result.get("provider"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Image gen failed for %d: %s", creation_id, e)
+        raise HTTPException(500, str(e))
+
+
+# ── Phase 1.3: Burst Approve/Reject ─────────────────────────
+
+
+@router.post("/approval/burst/{discovery_id}/approve-all")
+async def approve_burst(discovery_id: int):
+    """Approve all pending content for a discovery (burst approve)."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentCreation)
+            .where(ContentCreation.discovery_id == discovery_id)
+            .where(ContentCreation.approval_status.in_(["pending", "pending_review"]))
+        )
+        items = result.scalars().all()
+        if not items:
+            raise HTTPException(404, f"No pending content for discovery {discovery_id}")
+
+        now = datetime.now(timezone.utc)
+        for c in items:
+            c.approval_status = "approved"
+            c.approved_at = now
+        await session.commit()
+
+    return {"status": "approved", "discovery_id": discovery_id, "count": len(items)}
+
+
+@router.post("/approval/burst/{discovery_id}/reject-all")
+async def reject_burst(discovery_id: int):
+    """Reject all pending content for a discovery (burst reject)."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentCreation)
+            .where(ContentCreation.discovery_id == discovery_id)
+            .where(ContentCreation.approval_status.in_(["pending", "pending_review"]))
+        )
+        items = result.scalars().all()
+        if not items:
+            raise HTTPException(404, f"No pending content for discovery {discovery_id}")
+
+        for c in items:
+            c.approval_status = "rejected"
+        await session.commit()
+
+    return {"status": "rejected", "discovery_id": discovery_id, "count": len(items)}
+
+
+# ── Phase 2.1: Scheduling ───────────────────────────────────
+
+
+class ScheduleRequest(BaseModel):
+    creation_id: int
+    platform: str
+    scheduled_at: str  # ISO datetime
+
+
+class RescheduleRequest(BaseModel):
+    scheduled_at: str  # ISO datetime
+
+
+@router.get("/schedule")
+async def get_schedule(days: int = 7):
+    """Get scheduled content grouped by day."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=days)
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentSchedule)
+            .where(ContentSchedule.scheduled_at >= now)
+            .where(ContentSchedule.scheduled_at <= end)
+            .where(ContentSchedule.status.in_(["scheduled", "published"]))
+            .order_by(ContentSchedule.scheduled_at)
+        )
+        schedules = result.scalars().all()
+
+        # Fetch creation details
+        creation_ids = list({s.creation_id for s in schedules})
+        creation_map = {}
+        if creation_ids:
+            cr = await session.execute(
+                select(ContentCreation).where(ContentCreation.id.in_(creation_ids))
+            )
+            creation_map = {c.id: c for c in cr.scalars().all()}
+
+    # Group by date
+    by_day: dict[str, list] = {}
+    for s in schedules:
+        day_key = s.scheduled_at.strftime("%Y-%m-%d")
+        c = creation_map.get(s.creation_id)
+        by_day.setdefault(day_key, []).append({
+            "id": s.id,
+            "creation_id": s.creation_id,
+            "platform": s.platform,
+            "scheduled_at": s.scheduled_at.isoformat(),
+            "status": s.status,
+            "suggested_by": s.suggested_by,
+            "title": c.title if c else None,
+            "body_preview": (c.body or "")[:150] if c else None,
+            "media_urls": c.media_urls if c else None,
+        })
+
+    return {"days": by_day, "total": len(schedules)}
+
+
+@router.post("/schedule")
+async def create_schedule(data: ScheduleRequest):
+    """Manually schedule content for publishing."""
+    scheduled_at = datetime.fromisoformat(data.scheduled_at.replace("Z", "+00:00"))
+
+    async with async_session() as session:
+        creation = (await session.execute(
+            select(ContentCreation).where(ContentCreation.id == data.creation_id)
+        )).scalar_one_or_none()
+        if not creation:
+            raise HTTPException(404, f"Creation {data.creation_id} not found")
+
+        schedule = ContentSchedule(
+            creation_id=data.creation_id,
+            platform=data.platform,
+            scheduled_at=scheduled_at,
+            suggested_by="user",
+        )
+        session.add(schedule)
+        await session.commit()
+        await session.refresh(schedule)
+
+    return {"id": schedule.id, "status": "scheduled", "scheduled_at": scheduled_at.isoformat()}
+
+
+@router.put("/schedule/{schedule_id}")
+async def reschedule(schedule_id: int, data: RescheduleRequest):
+    """Reschedule a scheduled item."""
+    new_time = datetime.fromisoformat(data.scheduled_at.replace("Z", "+00:00"))
+
+    async with async_session() as session:
+        schedule = (await session.execute(
+            select(ContentSchedule).where(ContentSchedule.id == schedule_id)
+        )).scalar_one_or_none()
+        if not schedule:
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        if schedule.status != "scheduled":
+            raise HTTPException(400, f"Cannot reschedule item with status '{schedule.status}'")
+
+        schedule.scheduled_at = new_time
+        await session.commit()
+
+    return {"id": schedule_id, "status": "rescheduled", "scheduled_at": new_time.isoformat()}
+
+
+@router.delete("/schedule/{schedule_id}")
+async def cancel_schedule(schedule_id: int):
+    """Cancel a scheduled item."""
+    async with async_session() as session:
+        schedule = (await session.execute(
+            select(ContentSchedule).where(ContentSchedule.id == schedule_id)
+        )).scalar_one_or_none()
+        if not schedule:
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        if schedule.status != "scheduled":
+            raise HTTPException(400, f"Cannot cancel item with status '{schedule.status}'")
+
+        schedule.status = "cancelled"
+        await session.commit()
+
+    return {"id": schedule_id, "status": "cancelled"}
+
+
+@router.get("/schedule/suggestions")
+async def get_schedule_suggestions(platform: str = "linkedin"):
+    """Get suggested optimal posting times for a platform."""
+    # Platform-specific optimal posting windows (UTC)
+    suggestions = {
+        "linkedin": [
+            {"time": "13:00", "label": "Tue 1pm UTC", "reason": "Peak B2B engagement"},
+            {"time": "14:00", "label": "Wed 2pm UTC", "reason": "High professional traffic"},
+            {"time": "10:00", "label": "Thu 10am UTC", "reason": "Morning decision-makers"},
+        ],
+        "twitter": [
+            {"time": "15:00", "label": "Mon 3pm UTC", "reason": "Afternoon tech crowd"},
+            {"time": "17:00", "label": "Wed 5pm UTC", "reason": "End-of-day scrolling"},
+            {"time": "12:00", "label": "Fri 12pm UTC", "reason": "Lunch break engagement"},
+        ],
+        "tiktok": [
+            {"time": "19:00", "label": "Tue 7pm UTC", "reason": "Evening content consumption"},
+            {"time": "20:00", "label": "Thu 8pm UTC", "reason": "Peak mobile usage"},
+            {"time": "14:00", "label": "Sat 2pm UTC", "reason": "Weekend browsing"},
+        ],
+        "youtube_shorts": [
+            {"time": "16:00", "label": "Wed 4pm UTC", "reason": "Afternoon video watching"},
+            {"time": "11:00", "label": "Sat 11am UTC", "reason": "Weekend morning"},
+        ],
+        "medium": [
+            {"time": "11:00", "label": "Tue 11am UTC", "reason": "Morning reading window"},
+            {"time": "09:00", "label": "Thu 9am UTC", "reason": "Pre-meeting reading"},
+        ],
+    }
+    return {"platform": platform, "suggestions": suggestions.get(platform, suggestions["linkedin"])}
+
+
+@router.get("/timeline")
+async def get_timeline(days: int = 14):
+    """Aggregated timeline of published + scheduled + pending content."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+
+    async with async_session() as session:
+        # Published
+        pubs = (await session.execute(
+            select(ContentPublication)
+            .where(ContentPublication.published_at >= start)
+            .order_by(ContentPublication.published_at)
+        )).scalars().all()
+
+        # Scheduled
+        scheds = (await session.execute(
+            select(ContentSchedule)
+            .where(ContentSchedule.status == "scheduled")
+            .order_by(ContentSchedule.scheduled_at)
+        )).scalars().all()
+
+        # Fetch creation details for all
+        all_creation_ids = list(
+            {p.creation_id for p in pubs} | {s.creation_id for s in scheds}
+        )
+        creation_map = {}
+        if all_creation_ids:
+            cr = await session.execute(
+                select(ContentCreation).where(ContentCreation.id.in_(all_creation_ids))
+            )
+            creation_map = {c.id: c for c in cr.scalars().all()}
+
+    timeline = []
+    for p in pubs:
+        c = creation_map.get(p.creation_id)
+        timeline.append({
+            "type": "published",
+            "timestamp": p.published_at.isoformat() if p.published_at else None,
+            "platform": p.platform,
+            "title": c.title if c else None,
+            "creation_id": p.creation_id,
+            "platform_url": p.platform_url,
+        })
+    for s in scheds:
+        c = creation_map.get(s.creation_id)
+        timeline.append({
+            "type": "scheduled",
+            "timestamp": s.scheduled_at.isoformat(),
+            "platform": s.platform,
+            "title": c.title if c else None,
+            "creation_id": s.creation_id,
+            "schedule_id": s.id,
+        })
+
+    timeline.sort(key=lambda x: x.get("timestamp") or "")
+
+    return {"timeline": timeline, "total": len(timeline)}
+
+
+# ── Phase 3.1: Newsletter Pipeline ──────────────────────────
+
+
+class NewsletterGenerateRequest(BaseModel):
+    topic_focus: Optional[str] = None
+    lookback_days: int = 7
+    max_sections: int = 5
+
+
+@router.post("/newsletter/generate")
+async def generate_newsletter(data: NewsletterGenerateRequest | None = None):
+    """Generate a newsletter draft from recent discoveries."""
+    lookback_days = data.lookback_days if data else 7
+    max_sections = data.max_sections if data else 5
+    topic_focus = data.topic_focus if data else None
+
+    from datetime import timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+    async with async_session() as session:
+        query = (
+            select(ContentDiscovery)
+            .where(ContentDiscovery.discovered_at >= cutoff)
+            .where(ContentDiscovery.status.in_(["analyzed", "queued", "published"]))
+            .order_by(desc(ContentDiscovery.relevance_score))
+            .limit(max_sections * 3)
+        )
+        result = await session.execute(query)
+        discoveries = result.scalars().all()
+
+    if not discoveries:
+        raise HTTPException(404, "No recent discoveries to build newsletter from")
+
+    # Use LLM to generate newsletter content
+    try:
+        from agents.base import BaseAgent
+
+        agent = BaseAgent(agent_name="newsletter")
+        disc_summaries = "\n".join(
+            f"- [{d.source}] {d.title} (relevance: {d.relevance_score or 0:.1f})"
+            for d in discoveries[:max_sections * 2]
+        )
+
+        prompt = f"""Generate a newsletter titled "Last Week In Agentic AI" from these discoveries:
+
+{disc_summaries}
+
+{f'Focus on: {topic_focus}' if topic_focus else ''}
+
+Return a JSON object with:
+- "title": Newsletter title
+- "sections": Array of {{"heading": "Section Title", "summary": "2-3 sentence summary", "discovery_ids": [int ids]}}
+
+Return ONLY valid JSON, no markdown fences."""
+
+        resp = await agent._call_llm(prompt)
+        import json as json_mod
+        # Parse LLM response
+        text = resp.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        newsletter_data = json_mod.loads(text)
+
+    except Exception as e:
+        logger.error("Newsletter LLM generation failed: %s", e)
+        # Fallback: auto-generate sections from discoveries
+        sections = []
+        for d in discoveries[:max_sections]:
+            sections.append({
+                "heading": d.title,
+                "summary": f"From {d.source}: {d.title}. Relevance score: {d.relevance_score or 0:.1f}.",
+                "discovery_ids": [d.id],
+            })
+        newsletter_data = {
+            "title": "Last Week In Agentic AI",
+            "sections": sections,
+        }
+
+    # Generate header image
+    header_image_url = None
+    try:
+        from generators.image import ImageGenerator
+        gen = ImageGenerator()
+        img_result = await gen.generate(
+            prompt=f"Newsletter header: {newsletter_data['title']} - futuristic AI technology, clean design",
+            size="landscape_16_9",
+            style="professional",
+        )
+        if not img_result.get("error"):
+            header_image_url = img_result.get("url") or img_result.get("local_path")
+    except Exception as e:
+        logger.warning("Newsletter header image failed: %s", e)
+
+    # Render HTML
+    html_body = _render_newsletter_html(newsletter_data, header_image_url)
+
+    # Save draft
+    async with async_session() as session:
+        draft = NewsletterDraft(
+            title=newsletter_data.get("title", "Last Week In Agentic AI"),
+            sections=newsletter_data.get("sections", []),
+            html_body=html_body,
+            header_image_url=header_image_url,
+        )
+        session.add(draft)
+        await session.commit()
+        await session.refresh(draft)
+
+    return {
+        "id": draft.id,
+        "title": draft.title,
+        "sections": draft.sections,
+        "header_image_url": header_image_url,
+        "status": "draft",
+    }
+
+
+def _render_newsletter_html(data: dict, header_image_url: str | None = None) -> str:
+    """Render newsletter data to HTML email template."""
+    title = data.get("title", "Newsletter")
+    sections = data.get("sections", [])
+
+    sections_html = ""
+    for s in sections:
+        img_html = ""
+        if s.get("image_url"):
+            img_html = f'<img src="{s["image_url"]}" alt="" style="width:100%;border-radius:8px;margin-bottom:12px;">'
+        sections_html += f"""
+        <div style="margin-bottom:24px;padding:16px;background:#f9fafb;border-radius:8px;">
+            {img_html}
+            <h2 style="margin:0 0 8px;font-size:18px;color:#1a1a2e;">{s.get('heading', '')}</h2>
+            <p style="margin:0;font-size:14px;color:#4a4a6a;line-height:1.6;">{s.get('summary', '')}</p>
+        </div>"""
+
+    header_html = ""
+    if header_image_url:
+        header_html = f'<img src="{header_image_url}" alt="{title}" style="width:100%;border-radius:12px 12px 0 0;max-height:200px;object-fit:cover;">'
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:20px;background:#f0f0f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+    {header_html}
+    <div style="padding:24px;">
+        <h1 style="margin:0 0 4px;font-size:24px;color:#1a1a2e;">{title}</h1>
+        <p style="margin:0 0 24px;font-size:13px;color:#8888aa;">Curated by Autopilot AI</p>
+        {sections_html}
+        <div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;text-align:center;">
+            <p style="margin:0;font-size:12px;color:#aaa;">Powered by Autopilot by Kairox AI</p>
+        </div>
+    </div>
+</div>
+</body></html>"""
+
+
+@router.get("/newsletter/drafts")
+async def list_newsletter_drafts():
+    """List all newsletter drafts."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(NewsletterDraft).order_by(desc(NewsletterDraft.created_at))
+        )
+        drafts = result.scalars().all()
+
+    return {
+        "drafts": [
+            {
+                "id": d.id,
+                "title": d.title,
+                "sections_count": len(d.sections or []),
+                "header_image_url": d.header_image_url,
+                "status": d.status,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            }
+            for d in drafts
+        ],
+        "total": len(drafts),
+    }
+
+
+@router.get("/newsletter/drafts/{draft_id}")
+async def get_newsletter_draft(draft_id: int):
+    """Get full newsletter draft with sections."""
+    async with async_session() as session:
+        draft = (await session.execute(
+            select(NewsletterDraft).where(NewsletterDraft.id == draft_id)
+        )).scalar_one_or_none()
+        if not draft:
+            raise HTTPException(404, f"Newsletter draft {draft_id} not found")
+
+    return {
+        "id": draft.id,
+        "title": draft.title,
+        "sections": draft.sections,
+        "html_body": draft.html_body,
+        "header_image_url": draft.header_image_url,
+        "status": draft.status,
+        "created_at": draft.created_at.isoformat() if draft.created_at else None,
+    }
+
+
+@router.get("/newsletter/drafts/{draft_id}/preview")
+async def preview_newsletter(draft_id: int):
+    """Return raw HTML for iframe preview."""
+    from fastapi.responses import HTMLResponse
+
+    async with async_session() as session:
+        draft = (await session.execute(
+            select(NewsletterDraft).where(NewsletterDraft.id == draft_id)
+        )).scalar_one_or_none()
+        if not draft:
+            raise HTTPException(404, f"Newsletter draft {draft_id} not found")
+
+    return HTMLResponse(content=draft.html_body or "<p>No content</p>")
+
+
+@router.post("/newsletter/drafts/{draft_id}/approve")
+async def approve_newsletter(draft_id: int):
+    """Approve a newsletter draft."""
+    async with async_session() as session:
+        draft = (await session.execute(
+            select(NewsletterDraft).where(NewsletterDraft.id == draft_id)
+        )).scalar_one_or_none()
+        if not draft:
+            raise HTTPException(404, f"Newsletter draft {draft_id} not found")
+
+        draft.status = "approved"
+        draft.approved_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    return {"id": draft_id, "status": "approved"}
+
+
+@router.post("/newsletter/drafts/{draft_id}/send")
+async def send_newsletter(draft_id: int):
+    """Mark newsletter as sent (actual email sending would be plugged in here)."""
+    async with async_session() as session:
+        draft = (await session.execute(
+            select(NewsletterDraft).where(NewsletterDraft.id == draft_id)
+        )).scalar_one_or_none()
+        if not draft:
+            raise HTTPException(404, f"Newsletter draft {draft_id} not found")
+        if draft.status not in ("approved", "draft"):
+            raise HTTPException(400, f"Newsletter is already '{draft.status}'")
+
+        draft.status = "sent"
+        draft.sent_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    return {"id": draft_id, "status": "sent"}
+
+
+# ── Phase 4.1: Video Pipeline ───────────────────────────────
+
+
+class VideoGenerateRequest(BaseModel):
+    discovery_id: Optional[int] = None
+    title: str
+    script: Optional[str] = None
+    video_type: Optional[str] = None
+    target_platforms: list[str] = ["tiktok", "youtube_shorts"]
+
+
+@router.post("/video/generate")
+async def generate_video_creation(data: VideoGenerateRequest):
+    """Create a new video creation and start generation."""
+    async with async_session() as session:
+        vc = VideoCreation(
+            discovery_id=data.discovery_id,
+            title=data.title,
+            script=data.script,
+            video_type=data.video_type or "cinematic_broll",
+            target_platforms=data.target_platforms,
+            video_status="generating",
+        )
+        session.add(vc)
+        await session.commit()
+        await session.refresh(vc)
+        vc_id = vc.id
+
+    # Start async video generation
+    import asyncio
+    asyncio.create_task(_generate_video_creation(vc_id, data))
+
+    return {"id": vc_id, "status": "generating"}
+
+
+async def _generate_video_creation(vc_id: int, data: VideoGenerateRequest):
+    """Background: generate video + thumbnail for video creation."""
+    try:
+        from generators.video_router import VideoRouter
+        from generators.video_types import VideoType
+
+        router_inst = VideoRouter()
+        vt = VideoType.from_string(data.video_type) if data.video_type else VideoType.CINEMATIC_BROLL
+
+        result = await router_inst.generate(
+            video_type=vt,
+            video_script=data.script,
+            video_prompt=None,
+            video_composition=None,
+            platform=data.target_platforms[0] if data.target_platforms else "tiktok",
+            title=data.title,
+            body=data.script or data.title,
+        )
+
+        # Generate thumbnail
+        thumbnail_url = None
+        try:
+            from generators.image import ImageGenerator
+            gen = ImageGenerator()
+            thumb = await gen.generate(
+                prompt=f"Video thumbnail: {data.title} - eye-catching, bold text overlay style",
+                size="portrait_3_4",
+                style="vibrant",
+            )
+            if not thumb.get("error"):
+                thumbnail_url = thumb.get("url") or thumb.get("local_path")
+        except Exception as e:
+            logger.warning("Thumbnail gen failed for video %d: %s", vc_id, e)
+
+        async with async_session() as session:
+            vc = (await session.execute(
+                select(VideoCreation).where(VideoCreation.id == vc_id)
+            )).scalar_one_or_none()
+            if not vc:
+                return
+
+            if result.get("error"):
+                vc.video_status = "failed"
+                vc.error = result["error"]
+            else:
+                vc.video_status = "done"
+                vc.video_url = result.get("url") or result.get("local_path")
+                vc.thumbnail_url = thumbnail_url
+            await session.commit()
+
+    except Exception as e:
+        logger.error("Video creation gen failed for %d: %s", vc_id, e)
+        async with async_session() as session:
+            vc = (await session.execute(
+                select(VideoCreation).where(VideoCreation.id == vc_id)
+            )).scalar_one_or_none()
+            if vc:
+                vc.video_status = "failed"
+                vc.error = str(e)
+                await session.commit()
+
+
+@router.get("/video/creations")
+async def list_video_creations(limit: int = 50):
+    """List video creations."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(VideoCreation).order_by(desc(VideoCreation.created_at)).limit(limit)
+        )
+        items = result.scalars().all()
+
+    return {
+        "creations": [
+            {
+                "id": v.id,
+                "title": v.title,
+                "script": v.script,
+                "video_type": v.video_type,
+                "caption": v.caption,
+                "hashtags": v.hashtags,
+                "target_platforms": v.target_platforms,
+                "video_url": v.video_url,
+                "thumbnail_url": v.thumbnail_url,
+                "video_status": v.video_status,
+                "approval_status": v.approval_status,
+                "created_at": v.created_at.isoformat() if v.created_at else None,
+            }
+            for v in items
+        ],
+        "total": len(items),
+    }
+
+
+@router.get("/video/creations/{video_id}")
+async def get_video_creation(video_id: int):
+    """Get full video creation detail."""
+    async with async_session() as session:
+        vc = (await session.execute(
+            select(VideoCreation).where(VideoCreation.id == video_id)
+        )).scalar_one_or_none()
+        if not vc:
+            raise HTTPException(404, f"Video creation {video_id} not found")
+
+    return {
+        "id": vc.id,
+        "discovery_id": vc.discovery_id,
+        "title": vc.title,
+        "script": vc.script,
+        "video_type": vc.video_type,
+        "video_prompt": vc.video_prompt,
+        "video_composition": vc.video_composition,
+        "thumbnail_prompt": vc.thumbnail_prompt,
+        "caption": vc.caption,
+        "hashtags": vc.hashtags,
+        "target_platforms": vc.target_platforms,
+        "video_url": vc.video_url,
+        "thumbnail_url": vc.thumbnail_url,
+        "video_status": vc.video_status,
+        "approval_status": vc.approval_status,
+        "error": vc.error,
+        "created_at": vc.created_at.isoformat() if vc.created_at else None,
+    }
+
+
+@router.post("/video/creations/{video_id}/approve")
+async def approve_video_creation(video_id: int):
+    """Approve a video creation."""
+    async with async_session() as session:
+        vc = (await session.execute(
+            select(VideoCreation).where(VideoCreation.id == video_id)
+        )).scalar_one_or_none()
+        if not vc:
+            raise HTTPException(404, f"Video creation {video_id} not found")
+        vc.approval_status = "approved"
+        vc.approved_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    return {"id": video_id, "status": "approved"}
+
+
+@router.post("/video/creations/{video_id}/regenerate")
+async def regenerate_video(video_id: int):
+    """Regenerate video for a creation."""
+    async with async_session() as session:
+        vc = (await session.execute(
+            select(VideoCreation).where(VideoCreation.id == video_id)
+        )).scalar_one_or_none()
+        if not vc:
+            raise HTTPException(404, f"Video creation {video_id} not found")
+
+        vc.video_status = "generating"
+        vc.video_url = None
+        vc.error = None
+        await session.commit()
+
+        data = VideoGenerateRequest(
+            discovery_id=vc.discovery_id,
+            title=vc.title,
+            script=vc.script,
+            video_type=vc.video_type,
+            target_platforms=vc.target_platforms or ["tiktok"],
+        )
+
+    import asyncio
+    asyncio.create_task(_generate_video_creation(video_id, data))
+
+    return {"id": video_id, "status": "regenerating"}
 
 
 # ── Smoke test endpoints ─────────────────────────────────────
